@@ -6,31 +6,62 @@ I wanted to know what every query and every response costs on the wire, per sess
 
 ## What I found on day one
 
-Nine turns of one session, 23 November 2026:
+Monday 23 November 2026, the first day with the hooks in: two sessions on one box, 48 turns between 15:08 and 18:00, and **104 MB up, 4.1 MB down**. Session names are swapped for Session1 and Session2 here; the tool itself shows pseudonyms or names you give them.
+
+**Per hour** (`report --by hour`):
 
 ```
- #  calls  input  cache rd  cache wr  output  ctx/call     query  response  B/out
- 1      1      4     83313         5     532     83322  175.0 KB   40.9 KB     77
- 2      3      8    252071      1062    1313     84380  240.0 KB   33.0 KB     25
- 3      2      6    171031       881    1851     85959  215.5 KB   43.7 KB     24
- 4      3      8    264312      2181    2399     88833  278.3 KB   70.2 KB     29
- 5      1      4     90569        16     347     90589  183.3 KB   23.4 KB     67
- 6      1      4     90934        34     609     90972  175.5 KB   19.2 KB     32
- 7      2      6    183212       440     597     91829  174.5 KB   18.5 KB     31
- 9     10     22    994672     10870    9106    100556    1.8 MB  148.0 KB     16
-
-tokens: input 64, cache read 2'222'413, cache write 15'899, output 17'128
+hour             sess turns calls  input  cache rd cache wr  output    total         up      down
+2026-11-23 15:00    1    14    46    116     4.73M      40k     37k    4.81M     8.8 MB  743.7 KB
+2026-11-23 16:00    2    18    68    172     8.40M     120k     48k    8.57M    19.0 MB  884.5 KB
+2026-11-23 17:00    2    16    98    240    23.53M     166k    103k   23.80M    75.9 MB    2.4 MB
+total                    48   212    528    36.66M     326k    188k   37.17M   103.7 MB    4.1 MB
 ```
 
-(Turn 8 is left out: it was logged before a timing bug in the token count was fixed.)
+**A selection of turns** (`report`):
 
-Three things jump out.
+```
+started (local)  session                  #   dur     query  response    anth q    anth r   datadog reqs out tok  tel status
+11-23 15:08:22   Session1                 1    7s  175.0 KB   40.9 KB  175.0 KB   40.9 KB       0 B    1     532  ?   ok
+11-23 15:19:21   Session1                 9  105s    1.8 MB  148.0 KB    1.8 MB  145.5 KB       0 B   10    9106  ?   ok
+11-23 15:59:05   Session1                14  147s    2.7 MB  188.0 KB    2.7 MB  178.0 KB       0 B   12   12717  ?   ok
+11-23 16:13:01   Session2                 1   19s  316.5 KB   44.6 KB  316.5 KB   44.6 KB       0 B    3    1385  off ok
+11-23 16:14:42   Session1                20    5s  459.9 KB   11.0 KB  459.9 KB   11.0 KB       0 B    1     248  off ok
+11-23 16:19:35   Session2                 4   98s    1.6 MB  128.9 KB    1.6 MB  128.9 KB       0 B   12    8028  off ok (+1 mid-turn msg)
+11-23 16:21:15   Session1                21  110s    2.4 MB  138.2 KB    2.4 MB  138.2 KB       0 B    9    8540  off ok (+1 mid-turn msg)
+11-23 17:10:45   Session2                 8   37s    5.1 MB   77.4 KB    5.0 MB   41.8 KB       0 B    5    1940  off ok
+11-23 17:31:16   Session1                37  575s   29.6 MB    1.4 MB   29.6 MB  745.7 KB       0 B   37   49788  off ok (+2 mid-turn msg)
+11-23 17:43:11   Session1                38  108s   16.0 MB  140.9 KB   15.9 MB  117.7 KB       0 B   10    5775  off ok
+```
 
-**Every call sends the whole conversation again.** Prompt caching saves Anthropic compute, not my bandwidth. At about 100k tokens of context, each API call costs roughly 180 KB going up. Uploads ran at about nine times the downloads.
+**The same turns, tokens next to bytes** (`report --tokens`):
 
-**It goes up and up.** The cost of a call grows in a straight line with the conversation. You pay it again on every call, so the session total grows faster than the conversation does. Each tool Claude uses is another full upload. Turn 9 made ten calls and sent 1.8 MB. `/compact` and fresh sessions reset the meter.
+```
+started (local)  session                  # calls  input  cache rd cache wr  output ctx/call     query  response  B/out
+11-23 15:08:22   Session1                 1     1      4     83313        5     532    83322  175.0 KB   40.9 KB     77
+11-23 15:19:21   Session1                 9    10     22    994672    10870    9106   100556    1.8 MB  148.0 KB     16
+11-23 16:13:01   Session2                 1     3      6    177572    42907    1385    73495  316.5 KB   44.6 KB     32
+11-23 16:14:42   Session1                20     1      4    144735       17     248   144756  459.9 KB   11.0 KB     44
+11-23 17:10:45   Session2                 8     5     12    578997     3990    1940   116599    5.1 MB   77.4 KB     40
+11-23 17:31:16   Session1                37    37     84  10875374    97296   49788   296560   29.6 MB    1.4 MB     27
+11-23 17:43:11   Session1                38    10     22   3364058    10264    5775   337434   16.0 MB  140.9 KB     24
+```
 
-**Some of it goes to Datadog.** Claude Code ships logs to `http-intake.logs.us5.datadoghq.com`. In one turn that was 47 KB, against 193 KB for everything else. Cute. Over the first 13 turns it came to 115 KB in four bursts, 1.9% of the upload.
+What jumps out:
+
+**Every call sends the whole conversation again.** Prompt caching saves Anthropic compute, not my bandwidth. Session1's first turn sent 175 KB for a three-word question. Uploads ran at about 25 times the downloads.
+
+**It goes up and up.** The size of each call grows with the conversation (`ctx/call`): Session1 went from 83k tokens per call at 15:08 to 337k by 17:43. A single call that cost 175 KB at the start cost 460 KB two hours later. Each tool Claude uses is another full upload, so the heavy turns are the ones with many calls: turn 37 was a blog post written in one go, 37 calls in ten minutes, **29.6 MB up**.
+
+**Pasting big things hurts twice.** Turn 38 received a 14 KB base64 blob from another session. It sits in the conversation now, and every call after it carries it again.
+
+**Screenshots are the worst per token.** Session2 had hundreds of browser screenshots in its history: about 8 bytes per token, against 2&ndash;3 for text. Its turn 8 sent 5.1 MB for 1'940 output tokens.
+
+**Answers are cheap.** Around 15&ndash;30 bytes per output token (`B/out`), most of it the streaming wrapper around each token.
+
+**Some of it goes to Datadog.** Claude Code ships logs to `http-intake.logs.us5.datadoghq.com`: 115 KB in four bursts over the first 14 turns. With `DISABLE_TELEMETRY=1` set, it dropped to zero for the 34 turns since.
+
+Going back through the transcripts (`history`), the month before came to 1.24 billion tokens across two machines, 97% of them cache reads.
 
 ## What gets measured
 
