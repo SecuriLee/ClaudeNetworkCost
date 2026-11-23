@@ -113,7 +113,7 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py report --by day               # tokens and bytes per day (or --by hour)
 ./netcost.py history                       # tokens per day from ALL transcripts on this host
 ./netcost.py history --by project          # ... or --by hour | session | model
-./netcost.py digest --period week          # the Telegram digest, printed (day | week | month | auto)
+./netcost.py digest                        # the Telegram digest, printed (rolling 7/30 days; or --period day|week|month|auto)
 ./netcost.py report --session nimble       # one session
 ./netcost.py report --json --last 5        # raw rows
 ./netcost.py export [PATH] [--days 90] [--names]  # publish-safe JSON for a website
@@ -132,28 +132,28 @@ Claude Code deletes transcripts after 30 days unless you set `cleanupPeriodDays`
 
 ### A daily digest on Telegram
 
-`digest` sums up yesterday (and last week on Mondays, last month on the 1st): tokens with the change against the previous period, API calls, sessions, top projects, the busiest hour or day, and the network side where the hooks were running.
+`digest` sends one message each morning: the **last 7 days** and the **last 30 days** side by side, to the end of yesterday, each against the window before it (where transcripts reach that far back). Then a 30-day strip of output per day, the last 7 days as bars, projects for both windows, and the network side where the hooks were running.
 
 ```
-Claude on dozer · weekly
-week 47, 16 Nov to 22 Nov 2026
+Claude on dozer · rolling 7 and 30 days
+to the end of Sun 22 Nov 2026
 
-252.37M tokens  ▲73% on the week before
-output          997k  ▲47%
-cache read   247.12M
-cache write    4.25M
-fresh input     3.0k
-API calls       1261  ▲25%
-sessions           1
+7 days: 252.37M tokens  ▲73%
+30 days: 898.29M tokens
+                 7 days  30 days
+output             997k    3.78M
+  per active day   142k     126k
+cache read      247.12M  873.94M
+cache write       4.25M   20.55M
+API calls          1261     4988
+sessions              1        4
+active days         7/7    30/30
+Output ▲47% on the 7 days before.
 
-Projects (output tokens)
-Websites    326k ██████████
-MIREC3      185k ██████
-lee         164k █████
-reporting   151k █████
-templates   106k ███
-
-Days (output tokens)
+30 days (output per day)
+▂▇▄▁▂▁▂▁▁▃▆▁▂▁▇▂▃▁▃▁▃▂▁▅▂█▂▁▁▁
+24 Oct                  22 Nov
+Last 7 days
 Mon 16   243k ██████
 Tue 17   120k ███
 Wed 18   412k ██████████
@@ -161,7 +161,18 @@ Thu 19   107k ███
 Fri 20    48k █
 Sat 21    41k █
 Sun 22    27k █
+
+Projects (output tokens)
+              7d    30d
+Websites    326k  1.47M
+lee         164k   818k
+MIREC3      185k   631k
+reporting   151k   252k
+MFRWeb         -   212k
+templates   106k   110k
 ```
+
+Calendar periods are still there with `--period day|week|month`, and `auto` gives yesterday plus last week on Mondays and last month on the 1st.
 
 In Telegram the title is bold and the tables are monospace, so the columns and bars line up (`--html` prints the raw message). With `--telegram` it posts instead of printing. The bot token and chat come from the environment only: `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CNC_CHAT_ID` or else `TELEGRAM_CHAT_ID`. `deploy/` has a systemd service and timer (07:30 daily) that load them from a root-only `/etc/telegram-notify.env` and run as your user:
 

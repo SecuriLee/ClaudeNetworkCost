@@ -1405,6 +1405,120 @@ def digest_text(kind, today=None, host=None):
     return "\n".join(out)
 
 
+def rolling_text(today=None, host=None):
+    """One message: last 7 days and last 30 days (to end of yesterday), side by
+    side, each against the window before it where transcripts reach back."""
+    from datetime import timedelta
+    from html import escape
+    today = today or datetime.now().astimezone().date()
+    recs, _ = scan_transcripts()
+    if not recs:
+        return f"<b>Claude on {escape(host or socket.gethostname())}</b>\nNo Claude Code activity yet."
+    earliest = min(r["t"] for r in recs).date()
+    fields = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+
+    def window(days, back=0):
+        end = today - timedelta(days=back)
+        start = end - timedelta(days=days)
+        rs = [r for r in recs if start <= r["t"].date() < end]
+        x = {f: sum(r[f] for r in rs) for f in fields}
+        x["total"] = sum(x[f] for f in fields)
+        x["calls"] = len(rs)
+        x["sessions"] = len({r["session"] for r in rs})
+        x["active"] = len({r["t"].date() for r in rs})
+        x["complete"] = earliest <= start
+        return x, rs
+
+    w7, r7 = window(7)
+    w30, r30 = window(30)
+    p7, _ = window(7, 7)
+    p30, _ = window(30, 30)
+
+    def delta(a, b, ok=True):
+        if not b or not ok:
+            return ""
+        d = 100 * (a - b) / b
+        return f"{'▲' if d >= 0 else '▼'}{abs(d):.0f}%"
+
+    def bar(v, peak, width=10):
+        return "█" * max(1 if v else 0, round(width * v / peak)) if peak else ""
+
+    host = escape(host or socket.gethostname())
+    yday = today - timedelta(days=1)
+    out = [f"<b>Claude on {host}</b> · rolling 7 and 30 days", f"<i>to the end of {yday:%a %d %b %Y}</i>", ""]
+    d7 = delta(w7["total"], p7["total"], p7["complete"])
+    d30 = delta(w30["total"], p30["total"], p30["complete"])
+    out.append(f"<b>7 days: {fmt_tokens(w7['total'])} tokens</b>" + (f"  {d7}" if d7 else ""))
+    out.append(f"<b>30 days: {fmt_tokens(w30['total'])} tokens</b>" + (f"  {d30}" if d30 else ""))
+
+    tbl = [("", "7 days", "30 days"),
+           ("output", fmt_tokens(w7["output_tokens"]), fmt_tokens(w30["output_tokens"])),
+           ("  per active day", fmt_tokens(w7["output_tokens"] // max(w7["active"], 1)),
+            fmt_tokens(w30["output_tokens"] // max(w30["active"], 1))),
+           ("cache read", fmt_tokens(w7["cache_read_input_tokens"]), fmt_tokens(w30["cache_read_input_tokens"])),
+           ("cache write", fmt_tokens(w7["cache_creation_input_tokens"]),
+            fmt_tokens(w30["cache_creation_input_tokens"])),
+           ("API calls", str(w7["calls"]), str(w30["calls"])),
+           ("sessions", str(w7["sessions"]), str(w30["sessions"])),
+           ("active days", f"{w7['active']}/7", f"{w30['active']}/30")]
+    out.append("<pre>" + "\n".join(f"{a:<16}{b:>7} {c:>8}" for a, b, c in tbl) + "</pre>")
+    if w7["output_tokens"] and p7["output_tokens"] and p7["complete"]:
+        out.append(f"Output {delta(w7['output_tokens'], p7['output_tokens'])} on the 7 days before.")
+
+    # last 30 days, one block per day, height by output
+    days = defaultdict(int)
+    for r in r30:
+        days[r["t"].date()] += r["output_tokens"]
+    peak = max(days.values(), default=0)
+    if peak:
+        levels = " ▁▂▃▄▅▆▇█"
+        strip = ""
+        for i in range(30):
+            dd = today - timedelta(days=30 - i)
+            v = days.get(dd, 0)
+            strip += levels[max(1, min(8, round(8 * v / peak)))] if v else "·"
+        first = today - timedelta(days=30)
+        out.append("")
+        out.append("<b>30 days</b> (output per day)")
+        out.append(f"<pre>{strip}\n{first:%d %b}{'':{30 - 12}}{yday:%d %b}</pre>")
+        lines = []
+        for i in range(7):
+            dd = today - timedelta(days=7 - i)
+            v = days.get(dd, 0)
+            lines.append(f"{dd:%a %d} {fmt_tokens(v):>6} {bar(v, max(days.get(today - timedelta(days=k), 0) for k in range(1, 8)))}")
+        out.append("<b>Last 7 days</b>")
+        out.append("<pre>" + "\n".join(lines) + "</pre>")
+
+    p7d, p30d = defaultdict(int), defaultdict(int)
+    for r in r7:
+        p7d[r["project"]] += r["output_tokens"]
+    for r in r30:
+        p30d[r["project"]] += r["output_tokens"]
+    top = sorted(p30d.items(), key=lambda kv: -kv[1])[:6]
+    if top:
+        w = min(16, max(len(k) for k, _ in top))
+        out.append("")
+        out.append("<b>Projects</b> (output tokens)")
+        out.append("<pre>" + f"{'':<{w}} {'7d':>6} {'30d':>6}\n" + "\n".join(
+            f"{escape(k[:w]):<{w}} {fmt_tokens(p7d.get(k, 0)) if p7d.get(k) else '-':>6} {fmt_tokens(v):>6}"
+            for k, v in top) + "</pre>")
+
+    rows = [r for r in load_rows()
+            if today - timedelta(days=30) <= datetime.fromisoformat(r["started"]).astimezone().date() < today]
+    if rows:
+        labels = load_labels()
+        since = min(datetime.fromisoformat(r["started"]).astimezone().date() for r in rows)
+        up = sum(r["query_bytes"] for r in rows)
+        dn = sum(r["response_bytes"] for r in rows)
+        dd_b = sum(relabel(r, labels).get("datadog", {}).get("query", 0) for r in rows)
+        out.append("")
+        out.append(f"<b>Network</b> since {since:%d %b}: {human(up)} ↑  {human(dn)} ↓ · "
+                   f"{len(rows)} turns · Datadog {human(dd_b)}")
+    if not w30["complete"]:
+        out.append(f"<i>Transcripts here only go back to {earliest:%d %b}.</i>")
+    return "\n".join(out)
+
+
 def html_to_text(s):
     import re
     from html import unescape
@@ -1434,16 +1548,17 @@ def send_telegram(text):
 
 
 def digest(args):
-    """digest [--period day|week|month|auto] [--telegram] [--host NAME]
+    """digest [--period rolling|day|week|month|auto] [--telegram] [--host NAME]
+    rolling (default) = last 7 and last 30 days to the end of yesterday;
     auto = yesterday, plus last week on Mondays and last month on the 1st."""
-    opts, _ = parse_opts(args, period="auto", telegram=False, host=None, html=False)
+    opts, _ = parse_opts(args, period="rolling", telegram=False, host=None, html=False)
     today = datetime.now().astimezone().date()
     kinds = [opts["period"]] if opts["period"] != "auto" else \
         ["day"] + (["week"] if today.weekday() == 0 else []) + (["month"] if today.day == 1 else [])
     for kind in kinds:
-        if kind not in ("day", "week", "month"):
-            raise SystemExit("--period takes day, week, month or auto")
-        text = digest_text(kind, today, opts["host"])
+        if kind not in ("day", "week", "month", "rolling"):
+            raise SystemExit("--period takes rolling (default), day, week, month or auto")
+        text = rolling_text(today, opts["host"]) if kind == "rolling" else digest_text(kind, today, opts["host"])
         if opts["telegram"]:
             send_telegram(text)
         else:
@@ -1494,7 +1609,7 @@ def main():
               "       netcost.py name [<session> <alias...> | <session> --clear]\n"
               "       netcost.py merge <session> <turn>   (fold turn+1 into turn)\n"
               "       netcost.py history [--by day|hour|project|session|model] [--last N]\n"
-              "       netcost.py digest [--period day|week|month|auto] [--telegram]\n"
+              "       netcost.py digest [--period rolling|day|week|month|auto] [--telegram]\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
 

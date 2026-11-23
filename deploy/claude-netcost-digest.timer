@@ -1,5 +1,5 @@
 [Unit]
-Description=ClaudeNetworkCost digest: yesterday every morning, last week on Mondays, last month on the 1st
+Description=ClaudeNetworkCost digest: rolling 7 and 30 days, every morning
 
 [Timer]
 OnCalendar=*-*-* 07:30:00

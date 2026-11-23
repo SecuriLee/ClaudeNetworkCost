@@ -11,7 +11,7 @@ User=lee
 # its own; otherwise it falls back to TELEGRAM_CHAT_ID. systemd reads this
 # root-only file before dropping to User=, so lee never sees the token.
 EnvironmentFile=/etc/telegram-notify.env
-ExecStart=/usr/bin/python3 /home/lee/ClaudeNetworkCost/netcost.py digest --period auto --telegram
+ExecStart=/usr/bin/python3 /home/lee/ClaudeNetworkCost/netcost.py digest --period rolling --telegram
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
