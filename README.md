@@ -135,16 +135,35 @@ Claude Code deletes transcripts after 30 days unless you set `cleanupPeriodDays`
 `digest` sums up yesterday (and last week on Mondays, last month on the 1st): tokens with the change against the previous period, API calls, sessions, top projects, the busiest hour or day, and the network side where the hooks were running.
 
 ```
-Claude usage on dozer, weekly: week 47, 16 Nov to 22 Nov 2026
-Tokens: 252.37M (+73% vs previous)
-  output 997k (+47% vs previous)
-  cache read 247.12M, cache write 4.25M, fresh input 2956
-API calls: 1261 in 1 session
-Top projects by output: Websites 326k, MIREC3 185k, lee 164k, reporting 151k, templates 106k
-Busiest day: Wed 18 Nov (412k output)
+Claude on dozer · weekly
+week 47, 16 Nov to 22 Nov 2026
+
+252.37M tokens  ▲73% on the week before
+output          997k  ▲47%
+cache read   247.12M
+cache write    4.25M
+fresh input     3.0k
+API calls       1261  ▲25%
+sessions           1
+
+Projects (output tokens)
+Websites    326k ██████████
+MIREC3      185k ██████
+lee         164k █████
+reporting   151k █████
+templates   106k ███
+
+Days (output tokens)
+Mon 16   243k ██████
+Tue 17   120k ███
+Wed 18   412k ██████████
+Thu 19   107k ███
+Fri 20    48k █
+Sat 21    41k █
+Sun 22    27k █
 ```
 
-With `--telegram` it posts instead of printing. The bot token and chat come from the environment only: `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CNC_CHAT_ID` or else `TELEGRAM_CHAT_ID`. `deploy/` has a systemd service and timer (07:30 daily) that load them from a root-only `/etc/telegram-notify.env` and run as your user:
+In Telegram the title is bold and the tables are monospace, so the columns and bars line up (`--html` prints the raw message). With `--telegram` it posts instead of printing. The bot token and chat come from the environment only: `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CNC_CHAT_ID` or else `TELEGRAM_CHAT_ID`. `deploy/` has a systemd service and timer (07:30 daily) that load them from a root-only `/etc/telegram-notify.env` and run as your user:
 
 ```sh
 sudo cp deploy/claude-netcost-digest.{service,timer} /etc/systemd/system/

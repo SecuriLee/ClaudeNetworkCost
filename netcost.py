@@ -885,6 +885,8 @@ def fmt_tokens(n):
         return f"{n / 1e6:.2f}M"
     if n >= 10_000:
         return f"{n / 1e3:.0f}k"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}k"
     return str(n)
 
 
@@ -1292,7 +1294,9 @@ def _period(kind, today):
 
 
 def digest_text(kind, today=None, host=None):
+    """Telegram-HTML digest (bold title, monospace tables, bars)."""
     from datetime import timedelta
+    from html import escape
     today = today or datetime.now().astimezone().date()
     start, end, label = _period(kind, today)
     plen = (end - start).days
@@ -1315,43 +1319,76 @@ def digest_text(kind, today=None, host=None):
         if not b:
             return ""
         d = 100 * (a - b) / b
-        return f" ({'+' if d >= 0 else ''}{d:.0f}% vs previous)"
+        return f"{'▲' if d >= 0 else '▼'}{abs(d):.0f}%"
 
-    host = host or socket.gethostname()
+    def bar(v, peak, width=10):
+        return "█" * max(1 if v else 0, round(width * v / peak)) if peak else ""
+
+    host = escape(host or socket.gethostname())
     title = {"day": "Daily", "week": "Weekly", "month": "Monthly"}[kind]
-    lines = [f"Claude usage on {host}, {title.lower()}: {label}"]
+    out = [f"<b>Claude on {host}</b> · {title.lower()}", f"<i>{escape(label)}</i>", ""]
     if not cur:
-        lines.append("No Claude Code activity. A quiet one.")
-        return "\n".join(lines)
-    lines += [
-        f"Tokens: {fmt_tokens(c['total'])}{delta(c['total'], p['total'])}",
-        f"  output {fmt_tokens(c['output_tokens'])}{delta(c['output_tokens'], p['output_tokens'])}",
-        f"  cache read {fmt_tokens(c['cache_read_input_tokens'])}, cache write "
-        f"{fmt_tokens(c['cache_creation_input_tokens'])}, fresh input {fmt_tokens(c['input_tokens'])}",
-        f"API calls: {c['calls']} in {c['sessions']} session{'s' if c['sessions'] != 1 else ''}",
+        out.append("No Claude Code activity. A quiet one.")
+        return "\n".join(out)
+    prev_name = {"day": "the day before", "week": "the week before", "month": "the month before"}[kind]
+    d = delta(c["total"], p["total"])
+    out.append(f"<b>{fmt_tokens(c['total'])} tokens</b>" + (f"  {d} on {prev_name}" if d else ""))
+
+    rows_t = [
+        ("output", fmt_tokens(c["output_tokens"]), delta(c["output_tokens"], p["output_tokens"])),
+        ("cache read", fmt_tokens(c["cache_read_input_tokens"]), ""),
+        ("cache write", fmt_tokens(c["cache_creation_input_tokens"]), ""),
+        ("fresh input", fmt_tokens(c["input_tokens"]), ""),
+        ("API calls", str(c["calls"]), delta(c["calls"], p["calls"])),
+        ("sessions", str(c["sessions"]), ""),
     ]
-    earliest = min(r["t"] for r in recs).date()
-    if earliest > start:
-        lines.append(f"(transcripts on this host only go back to {earliest:%d %b})")
+    out.append("<pre>" + "\n".join(f"{k:<12}{v:>8}  {dl}".rstrip() for k, v, dl in rows_t) + "</pre>")
+
     projs = defaultdict(int)
     for r in cur:
         projs[r["project"]] += r["output_tokens"]
     top = sorted(projs.items(), key=lambda kv: -kv[1])[:5]
     if top:
-        lines.append("Top projects by output: " + ", ".join(f"{k} {fmt_tokens(v)}" for k, v in top))
+        w = min(16, max(len(k) for k, _ in top))
+        peak = top[0][1]
+        out.append("")
+        out.append("<b>Projects</b> (output tokens)")
+        out.append("<pre>" + "\n".join(
+            f"{escape(k[:w]):<{w}} {fmt_tokens(v):>6} {bar(v, peak)}" for k, v in top) + "</pre>")
+
     if kind == "day":
         hours = defaultdict(int)
         for r in cur:
             hours[r["t"].hour] += r["output_tokens"]
+        peak = max(hours.values())
+        # a 24-hour strip: one block per hour, height by output
+        levels = " ▁▂▃▄▅▆▇█"
+        strip = "".join(levels[max(1, min(8, round(8 * hours.get(h, 0) / peak)))] if hours.get(h) else "·"
+                        for h in range(24))
         h, v = max(hours.items(), key=lambda kv: kv[1])
-        lines.append(f"Busiest hour: {h:02d}:00 ({fmt_tokens(v)} output)")
+        out.append("")
+        out.append("<b>When</b>")
+        out.append(f"<pre>{strip}\n00    06    12    18   </pre>")
+        out.append(f"Busiest hour {h:02d}:00, {fmt_tokens(v)} output")
     else:
         days = defaultdict(int)
         for r in cur:
             days[r["t"].date()] += r["output_tokens"]
-        dd, v = max(days.items(), key=lambda kv: kv[1])
-        lines.append(f"Busiest day: {dd:%a %d %b} ({fmt_tokens(v)} output)")
-    # network side, where the hooks were running
+        if kind == "week":
+            peak = max(days.values())
+            lines = []
+            for i in range(7):
+                dd = start + timedelta(days=i)
+                v = days.get(dd, 0)
+                lines.append(f"{dd:%a %d} {fmt_tokens(v):>6} {bar(v, peak)}")
+            out.append("")
+            out.append("<b>Days</b> (output tokens)")
+            out.append("<pre>" + "\n".join(lines) + "</pre>")
+        else:
+            dd, v = max(days.items(), key=lambda kv: kv[1])
+            out.append(f"Busiest day {dd:%a %d %b}, {fmt_tokens(v)} output; "
+                       f"active on {len(days)} of {plen} days")
+
     rows = [r for r in load_rows()
             if start <= datetime.fromisoformat(r["started"]).astimezone().date() < end]
     if rows:
@@ -1359,9 +1396,20 @@ def digest_text(kind, today=None, host=None):
         up = sum(r["query_bytes"] for r in rows)
         dn = sum(r["response_bytes"] for r in rows)
         dd_b = sum(relabel(r, labels).get("datadog", {}).get("query", 0) for r in rows)
-        lines.append(f"Network: {human(up)} up, {human(dn)} down over {len(rows)} turns"
-                     + (f"; Datadog {human(dd_b)}" if dd_b else "; Datadog 0 B"))
-    return "\n".join(lines)
+        out.append("")
+        out.append(f"<b>Network</b> {human(up)} ↑  {human(dn)} ↓  · {len(rows)} turns · Datadog {human(dd_b)}")
+
+    earliest = min(r["t"] for r in recs).date()
+    if earliest > start:
+        out.append(f"<i>Transcripts here only go back to {earliest:%d %b}.</i>")
+    return "\n".join(out)
+
+
+def html_to_text(s):
+    import re
+    from html import unescape
+    s = s.replace("<pre>", "").replace("</pre>", "")
+    return unescape(re.sub(r"</?(b|i|code)>", "", s))
 
 
 def send_telegram(text):
@@ -1374,7 +1422,7 @@ def send_telegram(text):
     chat = os.environ.get("TELEGRAM_CNC_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CNC_CHAT_ID (or TELEGRAM_CHAT_ID) must be set")
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text,
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "true"}).encode()
     try:
         with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=15) as r:
@@ -1388,7 +1436,7 @@ def send_telegram(text):
 def digest(args):
     """digest [--period day|week|month|auto] [--telegram] [--host NAME]
     auto = yesterday, plus last week on Mondays and last month on the 1st."""
-    opts, _ = parse_opts(args, period="auto", telegram=False, host=None)
+    opts, _ = parse_opts(args, period="auto", telegram=False, host=None, html=False)
     today = datetime.now().astimezone().date()
     kinds = [opts["period"]] if opts["period"] != "auto" else \
         ["day"] + (["week"] if today.weekday() == 0 else []) + (["month"] if today.day == 1 else [])
@@ -1399,7 +1447,7 @@ def digest(args):
         if opts["telegram"]:
             send_telegram(text)
         else:
-            print(text)
+            print(text if opts["html"] else html_to_text(text))
             print()
 
 
