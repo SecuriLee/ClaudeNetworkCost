@@ -111,9 +111,18 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py report --tokens               # tokens next to bytes
 ./netcost.py report --session nimble       # one session
 ./netcost.py report --json --last 5        # raw rows
-./netcost.py export [PATH] [--days 90]     # publish-safe JSON for a website
+./netcost.py export [PATH] [--days 90] [--names]  # publish-safe JSON for a website
 ./netcost.py whois <claude-session-id>     # which pseudonym is this session?
+./netcost.py name                          # list your session names
+./netcost.py name nimble-merlin "CNC build"  # give a session a name you'll recognise
+./netcost.py name nimble-merlin --clear    # take it off again
 ```
+
+### Naming sessions
+
+Pseudonyms are fine for publishing and useless for remembering. `name` pins your own label on a session. You can point at it by pseudonym (or a unique prefix), by the 12-character `sid`, or by the real Claude session ID, which is hashed on the spot and never stored. The report then shows your label, and `--session` matches it.
+
+Names live in `~/.local/state/claude-netcost/aliases.json` (mode 600), beside the salt. `export` leaves them out, because "Q4 layoffs planning" is exactly the kind of name you don't want on a website. Add `--names` when you do want them in.
 
 Set `CLAUDE_NETCOST_EXPORT=/path/file.json` in the hook environment to re-export after every turn.
 
@@ -123,7 +132,7 @@ Set `CLAUDE_NETCOST_EXPORT=/path/file.json` in the hook environment to re-export
 |---|---|
 | private log, one JSON line per turn | `~/.local/share/claude-netcost/turns.jsonl` |
 | public export | `~/.local/share/claude-netcost/public/claude-netcost.json` |
-| in-flight state, salt, turn counters, DNS label cache, errors | `~/.local/state/claude-netcost/` |
+| in-flight state, salt, session names, turn counters, DNS label cache, errors | `~/.local/state/claude-netcost/` |
 
 `CLAUDE_NETCOST_DATA` and `CLAUDE_NETCOST_STATE` move them. `CLAUDE_NETCOST_INTERVAL` changes the sampling interval (default `1.0` seconds).
 
@@ -134,7 +143,7 @@ Set `CLAUDE_NETCOST_EXPORT=/path/file.json` in the hook environment to re-export
   "generated": "...", "schema": 1, "window_days": 90,
   "totals":   { "turns": 0, "query_bytes": 0, "response_bytes": 0,
                 "datadog_query_bytes": 0, "datadog_response_bytes": 0 },
-  "sessions": [ { "sid", "session_name", "first", "last", "turns", "query_bytes", "response_bytes" } ],
+  "sessions": [ { "sid", "session_name", "alias" (only with --names), "first", "last", "turns", "query_bytes", "response_bytes" } ],
   "turns":    [ { "started", "duration_s", "status", "sid", "session_name", "turn",
                   "query_bytes", "response_bytes", "query_wire", "response_wire",
                   "by_label": { "anthropic": { "query", "response" } },

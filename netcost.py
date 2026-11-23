@@ -765,9 +765,12 @@ def parse_opts(args, **defaults):
 def report(args):
     opts, _ = parse_opts(args, last=20, session=None, json=False, tokens=False)
     rows = load_rows()
+    aliases = load_aliases()
     if opts["session"]:
-        rows = [r for r in rows if opts["session"] in (r.get("sid"), r.get("session_name"))
-                or r.get("session_name", "").startswith(opts["session"])]
+        want = opts["session"].lower()
+        rows = [r for r in rows if want in (r.get("sid"), r.get("session_name"))
+                or r.get("session_name", "").startswith(want)
+                or aliases.get(r.get("sid"), "").lower().startswith(want)]
     if not rows:
         print(f"No turns logged yet ({LOG_FILE}).")
         return
@@ -792,7 +795,7 @@ def report(args):
             for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
                 tt[k] += u.get(k, 0)
             ot = u.get("output_tokens", 0)
-            print(f"{t:16} {r['session_name']:22} {r['turn']:>3} {calls:>5} {u.get('input_tokens', 0):>6} "
+            print(f"{t:16} {display_name(r, aliases):22} {r['turn']:>3} {calls:>5} {u.get('input_tokens', 0):>6} "
                   f"{u.get('cache_read_input_tokens', 0):>9} {u.get('cache_creation_input_tokens', 0):>8} "
                   f"{ot:>7} {tin // max(calls, 1):>8} {human(r['query_bytes']):>9} "
                   f"{human(r['response_bytes']):>9} {r['response_bytes'] / ot if ot else 0:>6.0f}")
@@ -810,7 +813,7 @@ def report(args):
         dd = r["by_label"].get("datadog", {})
         u = (r.get("usage") or {})
         tel = {True: "off", False: "on"}.get(r.get("telemetry_disabled"), "?")
-        print(f"{t:16} {r['session_name']:22} {r['turn']:>3} {r['duration_s']:>4.0f}s "
+        print(f"{t:16} {display_name(r, aliases):22} {r['turn']:>3} {r['duration_s']:>4.0f}s "
               f"{human(r['query_bytes']):>9} {human(r['response_bytes']):>9} "
               f"{human(api.get('query', 0)):>9} {human(api.get('response', 0)):>9} "
               f"{human(dd.get('query', 0) + dd.get('response', 0)):>9} "
@@ -862,7 +865,8 @@ def export(args):
     Contains no raw session ids, no paths, no IPs - only pseudonymous session
     ids/names, per-turn byte counts, per-label splits and token counts.
     """
-    opts, rest = parse_opts(args, days=90)
+    opts, rest = parse_opts(args, days=90, names=False)
+    aliases = load_aliases() if opts["names"] else {}
     out = rest[0] if rest else os.path.join(DATA_DIR, "public", "claude-netcost.json")
     cutoff = time.time() - opts["days"] * 86400
     turns = []
@@ -883,6 +887,7 @@ def export(args):
             "status": r["status"],
             "sid": r["sid"],
             "session_name": r["session_name"],
+            **({"alias": aliases[r["sid"]]} if r["sid"] in aliases else {}),
             "turn": r["turn"],
             "query_bytes": r["query_bytes"],
             "response_bytes": r["response_bytes"],
@@ -900,6 +905,7 @@ def export(args):
         }
         turns.append(t)
         s = sessions.setdefault(r["sid"], {"sid": r["sid"], "session_name": r["session_name"],
+                                           **({"alias": aliases[r["sid"]]} if r["sid"] in aliases else {}),
                                            "first": r["started"], "last": r["started"], "turns": 0,
                                            "query_bytes": 0, "response_bytes": 0})
         s["last"] = r["started"]
@@ -926,6 +932,65 @@ def export(args):
     write_json_atomic(out, doc)
     if sys.stdout.isatty():
         print(f"wrote {out} ({len(turns)} turns, {len(sessions)} sessions)")
+
+
+ALIAS_FILE = os.path.join(STATE_DIR, "aliases.json")
+
+
+def load_aliases():
+    a = load_json(ALIAS_FILE)
+    return a if isinstance(a, dict) else {}
+
+
+def display_name(row, aliases):
+    alias = aliases.get(row.get("sid"))
+    return alias[:22] if alias else row.get("session_name", "?")
+
+
+def resolve_session(ref):
+    """Accept a pseudonym (or prefix), a 12-hex sid, or a real Claude session id."""
+    rows = load_rows()
+    known = {}
+    for r in rows:
+        known[r["sid"]] = r["session_name"]
+    if ref in known:
+        return ref, known[ref]
+    hits = {sid: name for sid, name in known.items() if name == ref or name.startswith(ref)}
+    if len(hits) == 1:
+        return next(iter(hits.items()))
+    if len(hits) > 1:
+        raise SystemExit(f"'{ref}' matches several sessions: {', '.join(sorted(hits.values()))}")
+    if len(ref) >= 32:  # looks like a real Claude session id: hash it
+        return pseudonym(ref)
+    raise SystemExit(f"no session matches '{ref}' (try a name from `report`, or the real session id)")
+
+
+def name_cmd(args):
+    """name                      list aliases
+    name <session> <alias...>   set an alias (session = pseudonym, sid or real session id)
+    name <session> --clear      remove it"""
+    aliases = load_aliases()
+    if not args:
+        if not aliases:
+            print("No aliases yet. Set one: netcost.py name <session> <alias>")
+        known = {r["sid"]: r["session_name"] for r in load_rows()}
+        for sid, alias in sorted(aliases.items(), key=lambda kv: kv[1].lower()):
+            print(f"{alias:30} {known.get(sid, '(no turns logged)')}  ({sid})")
+        return
+    sid, pname = resolve_session(args[0])
+    if args[1:] == ["--clear"]:
+        aliases.pop(sid, None)
+        msg = f"cleared alias for {pname}"
+    elif len(args) >= 2:
+        aliases[sid] = " ".join(args[1:]).strip()
+        msg = f"{pname} ({sid}) -> {aliases[sid]}"
+    else:
+        print(f"{pname} ({sid}): {aliases.get(sid, 'no alias')}")
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_json_atomic(ALIAS_FILE, aliases)
+    os.chmod(ALIAS_FILE, 0o600)
+    print(msg)
 
 
 def whois(args):
@@ -956,10 +1021,13 @@ def main():
         export(sys.argv[2:])
     elif cmd == "whois":
         whois(sys.argv[2:])
+    elif cmd == "name":
+        name_cmd(sys.argv[2:])
     else:
         print("usage: netcost.py report [--last N] [--session NAME] [--json]\n"
               "       netcost.py export [PATH] [--days N]\n"
               "       netcost.py whois <claude-session-id>\n"
+              "       netcost.py name [<session> <alias...> | <session> --clear]\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
 
