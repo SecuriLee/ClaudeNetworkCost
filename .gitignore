@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# runtime data lives outside the repo (~/.local/state, ~/.local/share); never commit it
+turns.jsonl
+salt
+*.bak-netcost-*
