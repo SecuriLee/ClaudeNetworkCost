@@ -110,6 +110,7 @@ New sessions pick the hooks up. Running ones may need a restart.
 ```sh
 ./netcost.py report                        # last 20 turns, bytes, totals per destination
 ./netcost.py report --tokens               # tokens next to bytes
+./netcost.py report --by day               # tokens and bytes per day (or --by hour)
 ./netcost.py report --session nimble       # one session
 ./netcost.py report --json --last 5        # raw rows
 ./netcost.py export [PATH] [--days 90] [--names]  # publish-safe JSON for a website

@@ -803,7 +803,7 @@ def parse_opts(args, **defaults):
 
 
 def report(args):
-    opts, _ = parse_opts(args, last=20, session=None, json=False, tokens=False)
+    opts, _ = parse_opts(args, last=20, session=None, json=False, tokens=False, by=None)
     rows = load_rows()
     aliases = load_aliases()
     if opts["session"]:
@@ -822,6 +822,8 @@ def report(args):
             print(json.dumps(r))
         return
 
+    if opts["by"]:
+        return report_by(rows, opts["by"], opts["last"])
     if opts["tokens"]:
         print(f"{'started (local)':16} {'session':22} {'#':>3} {'calls':>5} {'input':>6} {'cache rd':>9} "
               f"{'cache wr':>8} {'output':>7} {'ctx/call':>8} {'query':>9} {'response':>9} {'B/out':>6}")
@@ -876,6 +878,54 @@ def report(args):
     for k, (a, b) in sorted(labs.items(), key=lambda kv: -sum(kv[1])):
         print(f"  {k:16} query {human(a):>9}   response {human(b):>9}")
     datadog_report(rows)
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1e3:.0f}k"
+    return str(n)
+
+
+def report_by(rows, by, last):
+    """Tokens and bytes per local day or hour."""
+    if by not in ("day", "hour"):
+        raise SystemExit("--by takes day or hour")
+    fmt = "%Y-%m-%d" if by == "day" else "%Y-%m-%d %H:00"
+    b = defaultdict(lambda: defaultdict(int))
+    sess = defaultdict(set)
+    for r in rows:
+        k = datetime.fromisoformat(r["started"]).astimezone().strftime(fmt)
+        u = r.get("usage") or {}
+        x = b[k]
+        x["turns"] += 1
+        x["calls"] += u.get("api_requests", 0)
+        for f in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+            x[f] += u.get(f, 0)
+        x["up"] += r["query_bytes"]
+        x["down"] += r["response_bytes"]
+        sess[k].add(r["sid"])
+    keys = sorted(b)[-last:]
+    w = 16 if by == "hour" else 10
+    print(f"{by:{w}} {'sess':>4} {'turns':>5} {'calls':>5} {'input':>6} {'cache rd':>9} {'cache wr':>8} "
+          f"{'output':>7} {'total':>8}  {'up':>9} {'down':>9}  output")
+    peak = max((b[k]["output_tokens"] for k in keys), default=0) or 1
+    tot = defaultdict(int)
+    for k in keys:
+        x = b[k]
+        total = x["input_tokens"] + x["cache_read_input_tokens"] + x["cache_creation_input_tokens"] + x["output_tokens"]
+        for f, v in x.items():
+            tot[f] += v
+        tot["total"] += total
+        bar = "#" * max(1 if x["output_tokens"] else 0, round(20 * x["output_tokens"] / peak))
+        print(f"{k:{w}} {len(sess[k]):>4} {x['turns']:>5} {x['calls']:>5} {fmt_tokens(x['input_tokens']):>6} "
+              f"{fmt_tokens(x['cache_read_input_tokens']):>9} {fmt_tokens(x['cache_creation_input_tokens']):>8} "
+              f"{fmt_tokens(x['output_tokens']):>7} {fmt_tokens(total):>8}  {human(x['up']):>9} {human(x['down']):>9}  {bar}")
+    print(f"{'total':{w}} {'':>4} {tot['turns']:>5} {tot['calls']:>5} {fmt_tokens(tot['input_tokens']):>6} "
+          f"{fmt_tokens(tot['cache_read_input_tokens']):>9} {fmt_tokens(tot['cache_creation_input_tokens']):>8} "
+          f"{fmt_tokens(tot['output_tokens']):>7} {fmt_tokens(tot['total']):>8}  {human(tot['up']):>9} {human(tot['down']):>9}")
+    print("(local time; total = input + cache read + cache write + output; bar = output tokens)")
 
 
 def datadog_report(rows):
