@@ -113,6 +113,7 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py report --by day               # tokens and bytes per day (or --by hour)
 ./netcost.py history                       # tokens per day from ALL transcripts on this host
 ./netcost.py history --by project          # ... or --by hour | session | model
+./netcost.py digest --period week          # the Telegram digest, printed (day | week | month | auto)
 ./netcost.py report --session nimble       # one session
 ./netcost.py report --json --last 5        # raw rows
 ./netcost.py export [PATH] [--days 90] [--names]  # publish-safe JSON for a website
@@ -128,6 +129,31 @@ New sessions pick the hooks up. Running ones may need a restart.
 The network side only starts when you install the hooks, but Claude Code has been saving token counts in its transcripts all along. `history` reads every transcript under `~/.claude/projects` (subagents included), counts each reply once even when a resumed session copied it into a new file, and gives tokens per day, hour, project (the folder Claude was working in), session or model. On my machine that went back six weeks and came to 1.16 billion tokens, 99% of them cache reads.
 
 Claude Code deletes transcripts after 30 days unless you set `cleanupPeriodDays` higher in `~/.claude/settings.json`, so history only reaches as far back as what's still on disk.
+
+### A daily digest on Telegram
+
+`digest` sums up yesterday (and last week on Mondays, last month on the 1st): tokens with the change against the previous period, API calls, sessions, top projects, the busiest hour or day, and the network side where the hooks were running.
+
+```
+Claude usage on dozer, weekly: week 47, 16 Nov to 22 Nov 2026
+Tokens: 252.37M (+73% vs previous)
+  output 997k (+47% vs previous)
+  cache read 247.12M, cache write 4.25M, fresh input 2956
+API calls: 1261 in 1 session
+Top projects by output: Websites 326k, MIREC3 185k, lee 164k, reporting 151k, templates 106k
+Busiest day: Wed 18 Nov (412k output)
+```
+
+With `--telegram` it posts instead of printing. The bot token and chat come from the environment only: `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CNC_CHAT_ID` or else `TELEGRAM_CHAT_ID`. `deploy/` has a systemd service and timer (07:30 daily) that load them from a root-only `/etc/telegram-notify.env` and run as your user:
+
+```sh
+sudo cp deploy/claude-netcost-digest.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start claude-netcost-digest.service     # send one now, to test
+sudo systemctl enable --now claude-netcost-digest.timer
+```
+
+Edit `User=` and the paths in the service if you're not `lee` or cloned somewhere else.
 
 ### Naming sessions
 

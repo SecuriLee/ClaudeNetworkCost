@@ -1,0 +1,18 @@
+[Unit]
+Description=ClaudeNetworkCost: Claude usage digest to Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the user whose ~/.claude transcripts and netcost data it reads.
+User=lee
+# Same bot as canary-notify. Set TELEGRAM_CNC_CHAT_ID there for a channel of
+# its own; otherwise it falls back to TELEGRAM_CHAT_ID. systemd reads this
+# root-only file before dropping to User=, so lee never sees the token.
+EnvironmentFile=/etc/telegram-notify.env
+ExecStart=/usr/bin/python3 /home/lee/ClaudeNetworkCost/netcost.py digest --period auto --telegram
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/lee/.local/state/claude-netcost

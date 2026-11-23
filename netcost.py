@@ -1157,22 +1157,14 @@ def merge_cmd(args):
     print(f"{pname}: merged turns {n} and {n + 1} (backup: {backup})")
 
 
-def history(args):
-    """Token usage per day/hour/project from every Claude Code transcript on this
-    host (~/.claude/projects), including subagents. No network bytes: those only
-    exist from when the hooks were installed."""
-    opts, _ = parse_opts(args, by="day", last=60, root=os.path.expanduser("~/.claude/projects"),
-                         json=False)
-    by = opts["by"]
-    if by not in ("day", "hour", "project", "session", "model"):
-        raise SystemExit("--by takes day, hour, project, session or model")
+def scan_transcripts(root=None):
+    """One record per API reply in every transcript under root (subagents
+    included), deduplicated by message id. Returns (records, n_files)."""
+    root = root or os.path.expanduser("~/.claude/projects")
     seen = set()
-    b = defaultdict(lambda: defaultdict(int))
-    sess = defaultdict(set)
-    first = last_ts = None
-    aliases = load_aliases()
+    recs = []
     files = []
-    for dirpath, _dirs, names in os.walk(opts["root"]):
+    for dirpath, _dirs, names in os.walk(root):
         files += [os.path.join(dirpath, n) for n in names if n.endswith(".jsonl")]
     for path in files:
         sub = "subagents" in path.split(os.sep)
@@ -1194,33 +1186,58 @@ def history(args):
                 u = m.get("usage")
                 mid = m.get("id") or d.get("requestId")
                 if not u or not mid or mid in seen or m.get("model") == "<synthetic>":
-                    continue  # <synthetic>: local placeholder replies, no API call
+                    continue
                 seen.add(mid)
                 ts = d.get("timestamp")
                 if not ts:
                     continue
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-                first = min(first, t) if first else t
-                last_ts = max(last_ts, t) if last_ts else t
-                session = d.get("sessionId") or "?"
-                sid, sname = pseudonym(session)
-                if by == "day":
-                    k = t.strftime("%Y-%m-%d")
-                elif by == "hour":
-                    k = t.strftime("%Y-%m-%d %H:00")
-                elif by == "project":
-                    k = os.path.basename((d.get("cwd") or "?").rstrip("/")) or "/"
-                elif by == "session":
-                    k = aliases.get(sid) or sname
-                else:
-                    k = m.get("model") or "?"
-                x = b[k]
-                x["calls"] += 1
-                x["sub_calls"] += 1 if (sub or d.get("isSidechain")) else 0
-                for fld in ("input_tokens", "cache_read_input_tokens",
-                            "cache_creation_input_tokens", "output_tokens"):
-                    x[fld] += int(u.get(fld) or 0)
-                sess[k].add(sid)
+                recs.append({
+                    "t": datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(),
+                    "session": d.get("sessionId") or "?",
+                    "project": os.path.basename((d.get("cwd") or "?").rstrip("/")) or "/",
+                    "model": m.get("model") or "?",
+                    "sub": sub or bool(d.get("isSidechain")),
+                    "input_tokens": int(u.get("input_tokens") or 0),
+                    "cache_read_input_tokens": int(u.get("cache_read_input_tokens") or 0),
+                    "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens") or 0),
+                    "output_tokens": int(u.get("output_tokens") or 0),
+                })
+    return recs, len(files)
+
+
+def history(args):
+    """Token usage per day/hour/project from every Claude Code transcript on this
+    host (~/.claude/projects), including subagents. No network bytes: those only
+    exist from when the hooks were installed."""
+    opts, _ = parse_opts(args, by="day", last=60, root=os.path.expanduser("~/.claude/projects"),
+                         json=False)
+    by = opts["by"]
+    if by not in ("day", "hour", "project", "session", "model"):
+        raise SystemExit("--by takes day, hour, project, session or model")
+    b = defaultdict(lambda: defaultdict(int))
+    sess = defaultdict(set)
+    aliases = load_aliases()
+    recs, nfiles = scan_transcripts(opts["root"])
+    first = min((r["t"] for r in recs), default=None)
+    last_ts = max((r["t"] for r in recs), default=None)
+    pseud = {}
+    for r in recs:
+        t = r["t"]
+        if r["session"] not in pseud:
+            pseud[r["session"]] = pseudonym(r["session"])
+        sid, sname = pseud[r["session"]]
+        k = {"day": lambda: t.strftime("%Y-%m-%d"),
+             "hour": lambda: t.strftime("%Y-%m-%d %H:00"),
+             "project": lambda: r["project"],
+             "session": lambda: aliases.get(sid) or sname,
+             "model": lambda: r["model"]}[by]()
+        x = b[k]
+        x["calls"] += 1
+        x["sub_calls"] += 1 if r["sub"] else 0
+        for fld in ("input_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens", "output_tokens"):
+            x[fld] += r[fld]
+        sess[k].add(sid)
     if not b:
         print(f"No usage found under {opts['root']}")
         return
@@ -1252,8 +1269,138 @@ def history(args):
           f"{fmt_tokens(tot['input_tokens']):>6} {fmt_tokens(tot['cache_read_input_tokens']):>9} "
           f"{fmt_tokens(tot['cache_creation_input_tokens']):>8} {fmt_tokens(tot['output_tokens']):>7} "
           f"{fmt_tokens(total(tot)):>8}")
-    print(f"({len(files)} transcripts, {first:%Y-%m-%d %H:%M} to {last_ts:%Y-%m-%d %H:%M} local; "
+    print(f"({nfiles} transcripts, {first:%Y-%m-%d %H:%M} to {last_ts:%Y-%m-%d %H:%M} local; "
           f"(sub) = calls made by subagents; bar = output tokens)")
+
+
+def _period(kind, today):
+    """(start, end, label) of the last complete day/week/month before today."""
+    from datetime import timedelta
+    if kind == "day":
+        end = today
+        start = end - timedelta(days=1)
+        label = f"{start:%a %d %b %Y}"
+    elif kind == "week":
+        end = today - timedelta(days=today.weekday())  # this Monday
+        start = end - timedelta(days=7)
+        label = f"week {start:%V}, {start:%d %b} to {(end - timedelta(days=1)):%d %b %Y}"
+    else:
+        end = today.replace(day=1)
+        start = (end - timedelta(days=1)).replace(day=1)
+        label = f"{start:%B %Y}"
+    return start, end, label
+
+
+def digest_text(kind, today=None, host=None):
+    from datetime import timedelta
+    today = today or datetime.now().astimezone().date()
+    start, end, label = _period(kind, today)
+    plen = (end - start).days
+    prev_start = start - timedelta(days=plen) if kind != "month" else \
+        (start - timedelta(days=1)).replace(day=1)
+    recs, _ = scan_transcripts()
+    cur = [r for r in recs if start <= r["t"].date() < end]
+    prev = [r for r in recs if prev_start <= r["t"].date() < start]
+    fields = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+
+    def tot(rs):
+        x = {f: sum(r[f] for r in rs) for f in fields}
+        x["total"] = sum(x.values())
+        x["calls"] = len(rs)
+        x["sessions"] = len({r["session"] for r in rs})
+        return x
+    c, p = tot(cur), tot(prev)
+
+    def delta(a, b):
+        if not b:
+            return ""
+        d = 100 * (a - b) / b
+        return f" ({'+' if d >= 0 else ''}{d:.0f}% vs previous)"
+
+    host = host or socket.gethostname()
+    title = {"day": "Daily", "week": "Weekly", "month": "Monthly"}[kind]
+    lines = [f"Claude usage on {host}, {title.lower()}: {label}"]
+    if not cur:
+        lines.append("No Claude Code activity. A quiet one.")
+        return "\n".join(lines)
+    lines += [
+        f"Tokens: {fmt_tokens(c['total'])}{delta(c['total'], p['total'])}",
+        f"  output {fmt_tokens(c['output_tokens'])}{delta(c['output_tokens'], p['output_tokens'])}",
+        f"  cache read {fmt_tokens(c['cache_read_input_tokens'])}, cache write "
+        f"{fmt_tokens(c['cache_creation_input_tokens'])}, fresh input {fmt_tokens(c['input_tokens'])}",
+        f"API calls: {c['calls']} in {c['sessions']} session{'s' if c['sessions'] != 1 else ''}",
+    ]
+    earliest = min(r["t"] for r in recs).date()
+    if earliest > start:
+        lines.append(f"(transcripts on this host only go back to {earliest:%d %b})")
+    projs = defaultdict(int)
+    for r in cur:
+        projs[r["project"]] += r["output_tokens"]
+    top = sorted(projs.items(), key=lambda kv: -kv[1])[:5]
+    if top:
+        lines.append("Top projects by output: " + ", ".join(f"{k} {fmt_tokens(v)}" for k, v in top))
+    if kind == "day":
+        hours = defaultdict(int)
+        for r in cur:
+            hours[r["t"].hour] += r["output_tokens"]
+        h, v = max(hours.items(), key=lambda kv: kv[1])
+        lines.append(f"Busiest hour: {h:02d}:00 ({fmt_tokens(v)} output)")
+    else:
+        days = defaultdict(int)
+        for r in cur:
+            days[r["t"].date()] += r["output_tokens"]
+        dd, v = max(days.items(), key=lambda kv: kv[1])
+        lines.append(f"Busiest day: {dd:%a %d %b} ({fmt_tokens(v)} output)")
+    # network side, where the hooks were running
+    rows = [r for r in load_rows()
+            if start <= datetime.fromisoformat(r["started"]).astimezone().date() < end]
+    if rows:
+        labels = load_labels()
+        up = sum(r["query_bytes"] for r in rows)
+        dn = sum(r["response_bytes"] for r in rows)
+        dd_b = sum(relabel(r, labels).get("datadog", {}).get("query", 0) for r in rows)
+        lines.append(f"Network: {human(up)} up, {human(dn)} down over {len(rows)} turns"
+                     + (f"; Datadog {human(dd_b)}" if dd_b else "; Datadog 0 B"))
+    return "\n".join(lines)
+
+
+def send_telegram(text):
+    """Token and chat come from the environment only (e.g. a systemd
+    EnvironmentFile); nothing is stored and the token is never printed."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CNC_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CNC_CHAT_ID (or TELEGRAM_CHAT_ID) must be set")
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text,
+                                   "disable_web_page_preview": "true"}).encode()
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=15) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Telegram said {e.code}: {e.read()[:300].decode(errors='replace')}")
+    except Exception as e:
+        raise SystemExit(f"Telegram send failed ({e.__class__.__name__})")
+
+
+def digest(args):
+    """digest [--period day|week|month|auto] [--telegram] [--host NAME]
+    auto = yesterday, plus last week on Mondays and last month on the 1st."""
+    opts, _ = parse_opts(args, period="auto", telegram=False, host=None)
+    today = datetime.now().astimezone().date()
+    kinds = [opts["period"]] if opts["period"] != "auto" else \
+        ["day"] + (["week"] if today.weekday() == 0 else []) + (["month"] if today.day == 1 else [])
+    for kind in kinds:
+        if kind not in ("day", "week", "month"):
+            raise SystemExit("--period takes day, week, month or auto")
+        text = digest_text(kind, today, opts["host"])
+        if opts["telegram"]:
+            send_telegram(text)
+        else:
+            print(text)
+            print()
 
 
 def whois(args):
@@ -1290,6 +1437,8 @@ def main():
         merge_cmd(sys.argv[2:])
     elif cmd == "history":
         history(sys.argv[2:])
+    elif cmd == "digest":
+        digest(sys.argv[2:])
     else:
         print("usage: netcost.py report [--last N] [--session NAME] [--json]\n"
               "       netcost.py export [PATH] [--days N]\n"
@@ -1297,6 +1446,7 @@ def main():
               "       netcost.py name [<session> <alias...> | <session> --clear]\n"
               "       netcost.py merge <session> <turn>   (fold turn+1 into turn)\n"
               "       netcost.py history [--by day|hour|project|session|model] [--last N]\n"
+              "       netcost.py digest [--period day|week|month|auto] [--telegram]\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
 
