@@ -79,7 +79,7 @@ Nothing between turns. During a turn, a reading takes about 15 ms of CPU, roughl
 - A connection that opens and closes between two readings is missed. That certainly applies to a quick `curl` from a Bash tool, and I suspect some short API connections too, which would make several of the day-one turns low. A firewall counter is the honest cross-check.
 - Everything the Claude process tree does during the turn is counted: model calls, remote control, telemetry, MCP servers. The destination split tells them apart where the IP allows.
 - A turn cancelled with Esc gets no `Stop` hook. It's logged as `interrupted` when the next prompt arrives (Claude Code leaves a `[Request interrupted by user]` line in the transcript, which is how the tool tells it apart).
-- A message typed while Claude is still working fires the prompt hook too, but Claude Code folds it into the running turn. The tool does the same: one turn, shown as `ok (+1 mid-turn msg)`.
+- A message typed while Claude is still working fires the prompt hook too, but Claude Code folds it into the running turn. The tool does the same: one turn, shown as `ok (+1 mid-turn msg)`. Turns split by older versions can be put back together with `merge`, which backs up the log first and renumbers the later turns.
 - Subagent tokens live in their own transcripts and aren't in the token columns yet. Their bytes are counted.
 
 ## Privacy
@@ -117,6 +117,7 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py name                          # list your session names
 ./netcost.py name nimble-merlin "CNC build"  # give a session a name you'll recognise
 ./netcost.py name nimble-merlin --clear    # take it off again
+./netcost.py merge "CNC build" 21          # fold turn 22 into turn 21 (a wrongly split turn)
 ```
 
 ### Naming sessions

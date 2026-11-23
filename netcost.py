@@ -996,7 +996,13 @@ def resolve_session(ref):
         known[r["sid"]] = r["session_name"]
     if ref in known:
         return ref, known[ref]
+    aliases = load_aliases()
     hits = {sid: name for sid, name in known.items() if name == ref or name.startswith(ref)}
+    if not hits:
+        low = ref.lower()
+        exact = {sid: known.get(sid, a) for sid, a in aliases.items() if a.lower() == low}
+        hits = exact or {sid: known.get(sid, a) for sid, a in aliases.items()
+                         if a.lower().startswith(low)}
     if len(hits) == 1:
         return next(iter(hits.items()))
     if len(hits) > 1:
@@ -1034,6 +1040,73 @@ def name_cmd(args):
     print(msg)
 
 
+def merge_cmd(args):
+    """merge <session> <turn>   fold turn N+1 into turn N (a turn wrongly split)"""
+    if len(args) != 2 or not args[1].isdigit():
+        raise SystemExit("usage: netcost.py merge <session> <turn>   (merges turn and turn+1)")
+    sid, pname = resolve_session(args[0])
+    n = int(args[1])
+    rows = load_rows()
+    idx = {r.get("turn"): i for i, r in enumerate(rows) if r.get("sid") == sid}
+    if n not in idx or n + 1 not in idx:
+        raise SystemExit(f"{pname}: need turns {n} and {n + 1} in the log")
+    a, b = rows[idx[n]], rows[idx[n + 1]]
+    m = dict(a)
+    m["ended"] = b["ended"]
+    m["duration_s"] = round(datetime.fromisoformat(b["ended"]).timestamp()
+                            - datetime.fromisoformat(a["started"]).timestamp(), 2)
+    m["status"] = b["status"]
+    for k in ("query_bytes", "response_bytes", "query_wire", "response_wire",
+              "retrans_segs", "new_conns", "prompt_chars"):
+        m[k] = (a.get(k) or 0) + (b.get(k) or 0)
+    m["extra_messages"] = (a.get("extra_messages") or 0) + (b.get("extra_messages") or 0) + 1
+    br = json.loads(json.dumps(a.get("by_remote") or {}))
+    for remote, rb in (b.get("by_remote") or {}).items():
+        ra = br.setdefault(remote, {"label": rb.get("label"), "procs": [], "conns": 0, "retrans": 0})
+        for k, v in rb.items():
+            if isinstance(v, int):
+                ra[k] = ra.get(k, 0) + v
+        ra["procs"] = sorted(set(ra.get("procs", [])) | set(rb.get("procs", [])))
+    m["by_remote"] = br
+    m["by_label"] = relabel(m, load_labels(refresh=False))
+    ua, ub = a.get("usage") or {}, b.get("usage") or {}
+    m["usage"] = {k: (ua.get(k) or 0) + (ub.get(k) or 0) for k in
+                  ("api_requests", "input_tokens", "output_tokens",
+                   "cache_read_input_tokens", "cache_creation_input_tokens")}
+    m["usage"]["models"] = sorted(set(ua.get("models", [])) | set(ub.get("models", [])))
+    m["merged"] = True
+    out = []
+    for i, r in enumerate(rows):
+        if i == idx[n + 1]:
+            continue
+        if i == idx[n]:
+            r = m
+        elif r.get("sid") == sid and (r.get("turn") or 0) > n + 1:
+            r = dict(r, turn=r["turn"] - 1)  # close the gap
+        out.append(r)
+    backup = f"{LOG_FILE}.bak-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    with open(LOG_FILE) as src, open(backup, "w") as dst:
+        dst.write(src.read())
+    tmp = f"{LOG_FILE}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        for r in out:
+            f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    os.replace(tmp, LOG_FILE)
+    for sp in os.listdir(STATE_DIR):  # a turn in flight for this session
+        if sp.endswith(".json") and sp.count("-") >= 4:
+            st = load_json(os.path.join(STATE_DIR, sp)) or {}
+            if st.get("sid") == sid and (st.get("turn") or 0) > n + 1:
+                st["turn"] -= 1
+                write_json_atomic(os.path.join(STATE_DIR, sp), st)
+    cpath = os.path.join(STATE_DIR, f"turns-{sid}")
+    try:
+        with open(cpath) as f:
+            write_text_atomic(cpath, str(max(0, int(f.read().strip()) - 1)))
+    except (OSError, ValueError):
+        pass
+    print(f"{pname}: merged turns {n} and {n + 1} (backup: {backup})")
+
+
 def whois(args):
     """Map a real Claude session id to its pseudonym (local only, needs the salt)."""
     if not args:
@@ -1064,11 +1137,14 @@ def main():
         whois(sys.argv[2:])
     elif cmd == "name":
         name_cmd(sys.argv[2:])
+    elif cmd == "merge":
+        merge_cmd(sys.argv[2:])
     else:
         print("usage: netcost.py report [--last N] [--session NAME] [--json]\n"
               "       netcost.py export [PATH] [--days N]\n"
               "       netcost.py whois <claude-session-id>\n"
               "       netcost.py name [<session> <alias...> | <session> --clear]\n"
+              "       netcost.py merge <session> <turn>   (fold turn+1 into turn)\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
 
