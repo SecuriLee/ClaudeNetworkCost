@@ -1207,12 +1207,44 @@ def scan_transcripts(root=None):
     return recs, len(files)
 
 
+def dump_history(path, root=None, host=None):
+    """Hourly buckets (hour x project x model x session pseudonym) of token
+    counts from all transcripts. Numbers and labels only: no prompt or
+    response text, no real session ids."""
+    recs, nfiles = scan_transcripts(root)
+    b = defaultdict(lambda: defaultdict(int))
+    pseud = {}
+    for r in recs:
+        if r["session"] not in pseud:
+            pseud[r["session"]] = pseudonym(r["session"])[0]
+        k = (r["t"].strftime("%Y-%m-%dT%H:00%z"), r["project"], r["model"], pseud[r["session"]], r["sub"])
+        x = b[k]
+        x["calls"] += 1
+        for f in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+            x[f] += r[f]
+    doc = {
+        "host": host or socket.gethostname(),
+        "generated": now_iso(),
+        "transcripts": nfiles,
+        "earliest": min((r["t"] for r in recs), default=datetime.now().astimezone()).isoformat(),
+        "latest": max((r["t"] for r in recs), default=datetime.now().astimezone()).isoformat(),
+        "buckets": [dict(hour=k[0], project=k[1], model=k[2], sid=k[3], sub=k[4], **v)
+                    for k, v in sorted(b.items())],
+    }
+    if path == "-":
+        json.dump(doc, sys.stdout)
+    else:
+        write_json_atomic(path, doc)
+
+
 def history(args):
     """Token usage per day/hour/project from every Claude Code transcript on this
     host (~/.claude/projects), including subagents. No network bytes: those only
     exist from when the hooks were installed."""
     opts, _ = parse_opts(args, by="day", last=60, root=os.path.expanduser("~/.claude/projects"),
-                         json=False)
+                         json=False, dump=None)
+    if opts["dump"]:
+        return dump_history(opts["dump"], opts["root"])
     by = opts["by"]
     if by not in ("day", "hour", "project", "session", "model"):
         raise SystemExit("--by takes day, hour, project, session or model")
