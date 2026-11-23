@@ -1157,6 +1157,105 @@ def merge_cmd(args):
     print(f"{pname}: merged turns {n} and {n + 1} (backup: {backup})")
 
 
+def history(args):
+    """Token usage per day/hour/project from every Claude Code transcript on this
+    host (~/.claude/projects), including subagents. No network bytes: those only
+    exist from when the hooks were installed."""
+    opts, _ = parse_opts(args, by="day", last=60, root=os.path.expanduser("~/.claude/projects"),
+                         json=False)
+    by = opts["by"]
+    if by not in ("day", "hour", "project", "session", "model"):
+        raise SystemExit("--by takes day, hour, project, session or model")
+    seen = set()
+    b = defaultdict(lambda: defaultdict(int))
+    sess = defaultdict(set)
+    first = last_ts = None
+    aliases = load_aliases()
+    files = []
+    for dirpath, _dirs, names in os.walk(opts["root"]):
+        files += [os.path.join(dirpath, n) for n in names if n.endswith(".jsonl")]
+    for path in files:
+        sub = "subagents" in path.split(os.sep)
+        try:
+            f = open(path, "rb")
+        except OSError:
+            continue
+        with f:
+            for raw in f:
+                if b'"usage"' not in raw or b'"assistant"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                m = d.get("message") or {}
+                u = m.get("usage")
+                mid = m.get("id") or d.get("requestId")
+                if not u or not mid or mid in seen or m.get("model") == "<synthetic>":
+                    continue  # <synthetic>: local placeholder replies, no API call
+                seen.add(mid)
+                ts = d.get("timestamp")
+                if not ts:
+                    continue
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                first = min(first, t) if first else t
+                last_ts = max(last_ts, t) if last_ts else t
+                session = d.get("sessionId") or "?"
+                sid, sname = pseudonym(session)
+                if by == "day":
+                    k = t.strftime("%Y-%m-%d")
+                elif by == "hour":
+                    k = t.strftime("%Y-%m-%d %H:00")
+                elif by == "project":
+                    k = os.path.basename((d.get("cwd") or "?").rstrip("/")) or "/"
+                elif by == "session":
+                    k = aliases.get(sid) or sname
+                else:
+                    k = m.get("model") or "?"
+                x = b[k]
+                x["calls"] += 1
+                x["sub_calls"] += 1 if (sub or d.get("isSidechain")) else 0
+                for fld in ("input_tokens", "cache_read_input_tokens",
+                            "cache_creation_input_tokens", "output_tokens"):
+                    x[fld] += int(u.get(fld) or 0)
+                sess[k].add(sid)
+    if not b:
+        print(f"No usage found under {opts['root']}")
+        return
+    if opts["json"]:
+        print(json.dumps({k: dict(v, sessions=len(sess[k])) for k, v in sorted(b.items())}, indent=1))
+        return
+    def total(x):
+        return (x["input_tokens"] + x["cache_read_input_tokens"]
+                + x["cache_creation_input_tokens"] + x["output_tokens"])
+    if by in ("day", "hour"):
+        keys = sorted(b)[-opts["last"]:]
+    else:
+        keys = sorted(b, key=lambda k: -b[k]["output_tokens"])[:opts["last"]]
+    w = max(10, min(24, max(len(k) for k in keys)))
+    print(f"{by:{w}} {'sess':>4} {'calls':>6} {'(sub)':>5} {'input':>6} {'cache rd':>9} {'cache wr':>8} "
+          f"{'output':>7} {'total':>8}  output")
+    peak = max(b[k]["output_tokens"] for k in keys) or 1
+    tot = defaultdict(int)
+    for k in keys:
+        x = b[k]
+        for f2, v in x.items():
+            tot[f2] += v
+        bar = "#" * max(1 if x["output_tokens"] else 0, round(24 * x["output_tokens"] / peak))
+        print(f"{k[:w]:{w}} {len(sess[k]):>4} {x['calls']:>6} {x['sub_calls'] or '':>5} "
+              f"{fmt_tokens(x['input_tokens']):>6} {fmt_tokens(x['cache_read_input_tokens']):>9} "
+              f"{fmt_tokens(x['cache_creation_input_tokens']):>8} {fmt_tokens(x['output_tokens']):>7} "
+              f"{fmt_tokens(total(x)):>8}  {bar}")
+    print(f"{'total':{w}} {'':>4} {tot['calls']:>6} {tot['sub_calls'] or '':>5} "
+          f"{fmt_tokens(tot['input_tokens']):>6} {fmt_tokens(tot['cache_read_input_tokens']):>9} "
+          f"{fmt_tokens(tot['cache_creation_input_tokens']):>8} {fmt_tokens(tot['output_tokens']):>7} "
+          f"{fmt_tokens(total(tot)):>8}")
+    print(f"({len(files)} transcripts, {first:%Y-%m-%d %H:%M} to {last_ts:%Y-%m-%d %H:%M} local; "
+          f"(sub) = calls made by subagents; bar = output tokens)")
+
+
 def whois(args):
     """Map a real Claude session id to its pseudonym (local only, needs the salt)."""
     if not args:
@@ -1189,12 +1288,15 @@ def main():
         name_cmd(sys.argv[2:])
     elif cmd == "merge":
         merge_cmd(sys.argv[2:])
+    elif cmd == "history":
+        history(sys.argv[2:])
     else:
         print("usage: netcost.py report [--last N] [--session NAME] [--json]\n"
               "       netcost.py export [PATH] [--days N]\n"
               "       netcost.py whois <claude-session-id>\n"
               "       netcost.py name [<session> <alias...> | <session> --clear]\n"
               "       netcost.py merge <session> <turn>   (fold turn+1 into turn)\n"
+              "       netcost.py history [--by day|hour|project|session|model] [--last N]\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
 

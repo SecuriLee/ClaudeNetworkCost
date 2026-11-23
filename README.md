@@ -111,6 +111,8 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py report                        # last 20 turns, bytes, totals per destination
 ./netcost.py report --tokens               # tokens next to bytes
 ./netcost.py report --by day               # tokens and bytes per day (or --by hour)
+./netcost.py history                       # tokens per day from ALL transcripts on this host
+./netcost.py history --by project          # ... or --by hour | session | model
 ./netcost.py report --session nimble       # one session
 ./netcost.py report --json --last 5        # raw rows
 ./netcost.py export [PATH] [--days 90] [--names]  # publish-safe JSON for a website
@@ -120,6 +122,12 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py name nimble-merlin --clear    # take it off again
 ./netcost.py merge "CNC build" 21          # fold turn 22 into turn 21 (a wrongly split turn)
 ```
+
+### Going back in time
+
+The network side only starts when you install the hooks, but Claude Code has been saving token counts in its transcripts all along. `history` reads every transcript under `~/.claude/projects` (subagents included), counts each reply once even when a resumed session copied it into a new file, and gives tokens per day, hour, project (the folder Claude was working in), session or model. On my machine that went back six weeks and came to 1.16 billion tokens, 99% of them cache reads.
+
+Claude Code deletes transcripts after 30 days unless you set `cleanupPeriodDays` higher in `~/.claude/settings.json`, so history only reaches as far back as what's still on disk.
 
 ### Naming sessions
 
