@@ -502,12 +502,51 @@ def file_size(path):
 
 # ---------------------------------------------------------------- turn logic
 
+def mid_turn_message(prev):
+    """True if the turn in `prev` is still running, i.e. this prompt was typed
+    mid-generation rather than after an Esc / crash."""
+    cpid = prev.get("claude_pid")
+    if not cpid or proc_comm(cpid) is None or cpid != find_claude_pid():
+        return False
+    if time.time() - prev.get("t0", 0) > MAX_TURN_SECONDS:
+        return False
+    spid = prev.get("sampler_pid")
+    if spid and proc_comm(spid) is None:
+        return False  # sampler gave up: turn is stale
+    path, off = prev.get("transcript_path"), prev.get("transcript_offset") or 0
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            for raw in f:
+                if b"Request interrupted by user" not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if d.get("type") == "user":
+                    return False  # Esc: the old turn is over
+    except OSError:
+        return False
+    return True
+
+
 def start_turn(hook):
     os.makedirs(STATE_DIR, exist_ok=True)
     session = hook.get("session_id") or "unknown"
     sp = state_path(session)
     if os.path.exists(sp):
-        # previous turn never got a Stop (interrupted with Esc, crash...)
+        prev = load_json(sp) or {}
+        if mid_turn_message(prev):
+            # A message typed while Claude was still working (Claude Code
+            # queues it into the running turn). Same turn: keep counting.
+            prev["extra_messages"] = prev.get("extra_messages", 0) + 1
+            prev["prompt_chars"] = (prev.get("prompt_chars") or 0) + len(hook.get("prompt") or "")
+            write_json_atomic(sp, prev)
+            return
+        # previous turn never got a Stop: Esc, crash, Claude restarted
         finish_turn(hook, status="interrupted")
 
     cpid = find_claude_pid()
@@ -646,6 +685,7 @@ def finish_turn(hook, status="ok"):
         "turn": state.get("turn") or next_turn_number(sid),
         "project": os.path.basename((state.get("cwd") or "").rstrip("/")) or None,
         "prompt_chars": state.get("prompt_chars"),
+        "extra_messages": state.get("extra_messages", 0),
         "telemetry_disabled": state.get("telemetry_disabled"),
         "query_bytes": tot["query"],
         "response_bytes": tot["response"],
@@ -817,7 +857,8 @@ def report(args):
               f"{human(r['query_bytes']):>9} {human(r['response_bytes']):>9} "
               f"{human(api.get('query', 0)):>9} {human(api.get('response', 0)):>9} "
               f"{human(dd.get('query', 0) + dd.get('response', 0)):>9} "
-              f"{u.get('api_requests', 0):>4} {u.get('output_tokens', 0):>7}  {tel:3} {r['status']}")
+              f"{u.get('api_requests', 0):>4} {u.get('output_tokens', 0):>7}  {tel:3} {r['status']}"
+              + (f" (+{r['extra_messages']} mid-turn msg)" if r.get("extra_messages") else ""))
 
     q = sum(r["query_bytes"] for r in rows)
     rs = sum(r["response_bytes"] for r in rows)

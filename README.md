@@ -78,7 +78,8 @@ Nothing between turns. During a turn, a reading takes about 15 ms of CPU, roughl
 - It counts **TCP payload**: the TLS records, not the plain text inside them. `*_wire` adds 52 bytes of header per segment as an estimate.
 - A connection that opens and closes between two readings is missed. That certainly applies to a quick `curl` from a Bash tool, and I suspect some short API connections too, which would make several of the day-one turns low. A firewall counter is the honest cross-check.
 - Everything the Claude process tree does during the turn is counted: model calls, remote control, telemetry, MCP servers. The destination split tells them apart where the IP allows.
-- A turn cancelled with Esc gets no `Stop` hook. It's logged as `interrupted` when the next prompt arrives.
+- A turn cancelled with Esc gets no `Stop` hook. It's logged as `interrupted` when the next prompt arrives (Claude Code leaves a `[Request interrupted by user]` line in the transcript, which is how the tool tells it apart).
+- A message typed while Claude is still working fires the prompt hook too, but Claude Code folds it into the running turn. The tool does the same: one turn, shown as `ok (+1 mid-turn msg)`.
 - Subagent tokens live in their own transcripts and aren't in the token columns yet. Their bytes are counted.
 
 ## Privacy
