@@ -30,7 +30,7 @@ Three things jump out.
 
 **It goes up and up.** The cost of a call grows in a straight line with the conversation. You pay it again on every call, so the session total grows faster than the conversation does. Each tool Claude uses is another full upload. Turn 9 made ten calls and sent 1.8 MB. `/compact` and fresh sessions reset the meter.
 
-**Some of it goes to Datadog.** Claude Code ships logs to `*.logs.us5.datadoghq.com`. In one turn that was 47 KB, against 193 KB for everything else. Cute.
+**Some of it goes to Datadog.** Claude Code ships logs to `http-intake.logs.us5.datadoghq.com`. In one turn that was 47 KB, against 193 KB for everything else. Cute. Over the first 13 turns it came to 115 KB in four bursts, 1.9% of the upload.
 
 ## What gets measured
 
@@ -39,9 +39,23 @@ Every turn (prompt in, finished answer out) logs:
 - **query bytes**: what went up (my prompt, the conversation, tool results)
 - **response bytes**: what came back (the answer, thinking, tool calls)
 - an estimate of the bytes **on the wire**, including IP/TCP headers
-- a split by destination: `anthropic` (API and claude.ai remote control share one IP), `datadog-telemetry`, `lan`, `loopback`, `other`
+- a split by destination: `anthropic` (API and claude.ai remote control share one IP), `anthropic-updates`, `datadog`, `github`, `lan`, `loopback`, `other`
+- whether **telemetry was disabled** for that turn (`DISABLE_TELEMETRY` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`)
 - **tokens** from the session transcript: fresh input, cache read, cache write, output, number of API calls, model
 - a **pseudonymous session name** such as `nimble-merlin-e34e`, plus the turn number
+
+## Datadog
+
+If telemetry isn't disabled, Claude Code ships logs to Datadog. The report gives it its own column and a summary, split by whether telemetry was off for each turn. ("Setting not recorded" covers turns logged before the tool started recording it; on day one telemetry was on.)
+
+```
+Datadog (Claude Code log/telemetry shipping):
+  setting not recorded    13 turns: 114.9 KB up / 11.5 KB down (1.9% of upload), in 4 of 13 turns
+```
+
+Datadog moves its IPs around, so the tool doesn't pin addresses. It resolves the intake hostnames found in the Claude Code binary (`http-intake.logs.*`, `browser-intake-*`, for US1, US3, US5 and EU), caches the answers for six hours and keeps every address it has ever seen, so older turns keep their label. Answers that come back as `0.0.0.0` or `::` (a DNS block list doing its job) are ignored. If Datadog traffic still shows up in turns with telemetry disabled, the report says so.
+
+Add your own names in `~/.config/claude-netcost/hosts.json`: `{"intake.example.com": "label"}`.
 
 ## How it works
 
@@ -109,7 +123,7 @@ Set `CLAUDE_NETCOST_EXPORT=/path/file.json` in the hook environment to re-export
 |---|---|
 | private log, one JSON line per turn | `~/.local/share/claude-netcost/turns.jsonl` |
 | public export | `~/.local/share/claude-netcost/public/claude-netcost.json` |
-| in-flight state, salt, turn counters, errors | `~/.local/state/claude-netcost/` |
+| in-flight state, salt, turn counters, DNS label cache, errors | `~/.local/state/claude-netcost/` |
 
 `CLAUDE_NETCOST_DATA` and `CLAUDE_NETCOST_STATE` move them. `CLAUDE_NETCOST_INTERVAL` changes the sampling interval (default `1.0` seconds).
 
@@ -118,13 +132,14 @@ Set `CLAUDE_NETCOST_EXPORT=/path/file.json` in the hook environment to re-export
 ```json
 {
   "generated": "...", "schema": 1, "window_days": 90,
-  "totals":   { "turns": 0, "query_bytes": 0, "response_bytes": 0 },
+  "totals":   { "turns": 0, "query_bytes": 0, "response_bytes": 0,
+                "datadog_query_bytes": 0, "datadog_response_bytes": 0 },
   "sessions": [ { "sid", "session_name", "first", "last", "turns", "query_bytes", "response_bytes" } ],
   "turns":    [ { "started", "duration_s", "status", "sid", "session_name", "turn",
                   "query_bytes", "response_bytes", "query_wire", "response_wire",
                   "by_label": { "anthropic": { "query", "response" } },
                   "api_requests", "input_tokens", "cache_read_tokens", "cache_write_tokens",
-                  "output_tokens", "models" } ]
+                  "output_tokens", "models", "telemetry_disabled" } ]
 }
 ```
 

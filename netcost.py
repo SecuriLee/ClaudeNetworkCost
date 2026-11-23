@@ -27,6 +27,7 @@ import secrets
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -55,12 +56,33 @@ HDR_V6 = 40 + 32
 # Extend in ~/.config/claude-netcost/labels.json: {"1.2.3.0/24": "name"}.
 # api.anthropic.com and claude.ai (incl. remote-control relay) share these, so
 # model calls and remote-control sync can't be told apart by address.
-# Datadog: Claude Code's log/telemetry shipping (*.logs.us5.datadoghq.com).
 LABELS = {
     "160.79.104.0/23": "anthropic",
     "2607:6bc0::/48": "anthropic",
-    "34.149.66.165/32": "datadog-telemetry",
 }
+
+# Hostnames resolved (cached, see DNS_TTL) and labelled by the addresses they
+# return. The Datadog names are the log/telemetry intakes built into the
+# Claude Code binary; Datadog moves IPs around, so names beat pinned ranges.
+# Extend in ~/.config/claude-netcost/hosts.json: {"host.example": "label"}.
+HOST_LABELS = {
+    "api.anthropic.com": "anthropic",
+    "claude.ai": "anthropic",
+    "downloads.claude.ai": "anthropic-updates",
+    "github.com": "github",
+    "api.github.com": "github",
+    "http-intake.logs.us5.datadoghq.com": "datadog",
+    "browser-intake-us5-datadoghq.com": "datadog",
+    "http-intake.logs.datadoghq.com": "datadog",
+    "browser-intake-datadoghq.com": "datadog",
+    "http-intake.logs.datadoghq.eu": "datadog",
+    "browser-intake-datadoghq.eu": "datadog",
+    "http-intake.logs.us3.datadoghq.com": "datadog",
+    "browser-intake-us3-datadoghq.com": "datadog",
+}
+DNS_TTL = 6 * 3600
+# labels used by older versions of this tool, mapped to current ones
+LEGACY_LABELS = {"anthropic-api": "anthropic", "datadog-telemetry": "datadog"}
 
 
 ADJ = ("amber", "brisk", "calm", "dusky", "eager", "fern", "gilded", "hazel", "ivory", "jade",
@@ -305,12 +327,78 @@ def load_json(path):
         return None
 
 
-def load_labels():
+def dns_labels(refresh=True):
+    """{ip: label} for HOST_LABELS. Cached in STATE_DIR; IPs once seen are kept,
+    so traffic logged before a DNS change still gets its label."""
+    path = os.path.join(STATE_DIR, "dns-cache.json")
+    cache = load_json(path) or {}
+    ips = {k: v for k, v in cache.get("ips", {}).items() if k not in ("0.0.0.0", "::")}
+    if refresh and time.time() - cache.get("resolved", 0) > DNS_TTL:
+        hosts = dict(HOST_LABELS)
+        extra = load_json(os.path.expanduser("~/.config/claude-netcost/hosts.json"))
+        if isinstance(extra, dict):
+            hosts.update(extra)
+        old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(3)
+        try:
+            for host, lab in hosts.items():
+                try:
+                    for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP):
+                        a = info[4][0]
+                        ip = ipaddress.ip_address(a.split("%")[0])
+                        # skip sinkholed/blocked answers (0.0.0.0, ::, private)
+                        if ip.is_unspecified or ip.is_loopback or ip.is_private:
+                            continue
+                        ips[a] = lab
+                except OSError:
+                    pass
+        finally:
+            socket.setdefaulttimeout(old)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            write_json_atomic(path, {"resolved": time.time(), "ips": ips})
+        except OSError:
+            pass
+    return ips
+
+
+def load_labels(refresh=True):
     labels = dict(LABELS)
+    for ip, lab in dns_labels(refresh).items():
+        labels[ip] = lab
     extra = load_json(os.path.expanduser("~/.config/claude-netcost/labels.json"))
     if isinstance(extra, dict):
         labels.update(extra)
-    return [(ipaddress.ip_network(k, strict=False), v) for k, v in labels.items()]
+    nets = []
+    for k, v in labels.items():
+        try:
+            nets.append((ipaddress.ip_network(k, strict=False), v))
+        except ValueError:
+            pass
+    # most specific first, so a single-IP label beats a broad range
+    nets.sort(key=lambda nv: -nv[0].prefixlen)
+    return nets
+
+
+def relabel(row, labels):
+    """Recompute by_label from by_remote with the current labels."""
+    out = defaultdict(lambda: defaultdict(int))
+    for remote, r in (row.get("by_remote") or {}).items():
+        host, _ = split_hostport(remote)
+        lab = label_for(host, labels)
+        for k in ("query", "response", "query_wire", "response_wire"):
+            out[lab][k] += r.get(k, 0)
+    if not out:  # very old rows without by_remote
+        for k, v in (row.get("by_label") or {}).items():
+            for kk, vv in v.items():
+                out[LEGACY_LABELS.get(k, k)][kk] += vv
+    return {k: dict(v) for k, v in out.items()}
+
+
+def telemetry_disabled():
+    truthy = lambda v: (v or "").strip().lower() not in ("", "0", "false", "no")
+    return truthy(os.environ.get("DISABLE_TELEMETRY")) or \
+        truthy(os.environ.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"))
 
 
 def split_hostport(addr):
@@ -443,6 +531,7 @@ def start_turn(hook):
         "t0": time.time(),
         "cwd": hook.get("cwd"),
         "prompt_chars": len(prompt),
+        "telemetry_disabled": telemetry_disabled(),
         "transcript_path": hook.get("transcript_path"),
         "transcript_offset": file_size(hook.get("transcript_path")),
         "sockets": acc,
@@ -511,7 +600,7 @@ def finish_turn(hook, status="ok"):
         tree = process_tree(cpid)
         merge(state["sockets"], sample_sockets(tree), tree)
 
-    labels = load_labels()
+    labels = load_labels(refresh=False)  # no DNS in the Stop hook; finalize refreshes
     zero = {"sent": 0, "recv": 0, "segs_out": 0, "segs_in": 0, "retrans": 0}
     by_remote = {}
     tot = defaultdict(int)
@@ -557,6 +646,7 @@ def finish_turn(hook, status="ok"):
         "turn": state.get("turn") or next_turn_number(sid),
         "project": os.path.basename((state.get("cwd") or "").rstrip("/")) or None,
         "prompt_chars": state.get("prompt_chars"),
+        "telemetry_disabled": state.get("telemetry_disabled"),
         "query_bytes": tot["query"],
         "response_bytes": tot["response"],
         "query_wire": tot["query_wire"],
@@ -590,6 +680,7 @@ def finalize(pending):
         return
     wait_transcript_settled(job.get("transcript_path"))
     row = job["row"]
+    row["by_label"] = relabel(row, load_labels(refresh=True))
     row["usage"] = transcript_usage(job.get("transcript_path"), job.get("transcript_offset"))
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(LOG_FILE, "a") as f:
@@ -680,6 +771,9 @@ def report(args):
     if not rows:
         print(f"No turns logged yet ({LOG_FILE}).")
         return
+    labels = load_labels()
+    for r in rows:
+        r["by_label"] = relabel(r, labels)
     if opts["json"]:
         for r in rows[-opts["last"]:]:
             print(json.dumps(r))
@@ -709,15 +803,18 @@ def report(args):
         return
 
     print(f"{'started (local)':16} {'session':22} {'#':>3} {'dur':>5} {'query':>9} {'response':>9} "
-          f"{'anth q':>9} {'anth r':>9} {'reqs':>4} {'out tok':>7}  status")
+          f"{'anth q':>9} {'anth r':>9} {'datadog':>9} {'reqs':>4} {'out tok':>7}  {'tel':3} status")
     for r in rows[-opts["last"]:]:
         t = datetime.fromisoformat(r["started"]).astimezone().strftime("%m-%d %H:%M:%S")
-        api = (r["by_label"].get("anthropic") or r["by_label"].get("anthropic-api") or {})
+        api = r["by_label"].get("anthropic", {})
+        dd = r["by_label"].get("datadog", {})
         u = (r.get("usage") or {})
+        tel = {True: "off", False: "on"}.get(r.get("telemetry_disabled"), "?")
         print(f"{t:16} {r['session_name']:22} {r['turn']:>3} {r['duration_s']:>4.0f}s "
               f"{human(r['query_bytes']):>9} {human(r['response_bytes']):>9} "
               f"{human(api.get('query', 0)):>9} {human(api.get('response', 0)):>9} "
-              f"{u.get('api_requests', 0):>4} {u.get('output_tokens', 0):>7}  {r['status']}")
+              f"{human(dd.get('query', 0) + dd.get('response', 0)):>9} "
+              f"{u.get('api_requests', 0):>4} {u.get('output_tokens', 0):>7}  {tel:3} {r['status']}")
 
     q = sum(r["query_bytes"] for r in rows)
     rs = sum(r["response_bytes"] for r in rows)
@@ -734,6 +831,29 @@ def report(args):
             labs[k][1] += v.get("response", 0)
     for k, (a, b) in sorted(labs.items(), key=lambda kv: -sum(kv[1])):
         print(f"  {k:16} query {human(a):>9}   response {human(b):>9}")
+    datadog_report(rows)
+
+
+def datadog_report(rows):
+    """How much Claude Code shipped to Datadog, split by the telemetry setting."""
+    groups = {"on": [], "off": [], "?": []}
+    for r in rows:
+        groups[{True: "off", False: "on"}.get(r.get("telemetry_disabled"), "?")].append(r)
+    print()
+    print("Datadog (Claude Code log/telemetry shipping):")
+    for key, title in (("on", "telemetry on"), ("off", "telemetry disabled"), ("?", "setting not recorded")):
+        g = groups[key]
+        if not g:
+            continue
+        dd_up = sum(r["by_label"].get("datadog", {}).get("query", 0) for r in g)
+        dd_dn = sum(r["by_label"].get("datadog", {}).get("response", 0) for r in g)
+        up = sum(r["query_bytes"] for r in g)
+        hit = sum(1 for r in g if r["by_label"].get("datadog"))
+        share = f"{100 * dd_up / up:.1f}% of upload" if up else "-"
+        print(f"  {title:21} {len(g):>4} turns: {human(dd_up)} up / {human(dd_dn)} down "
+              f"({share}), in {hit} of {len(g)} turns")
+    if groups["off"] and any(r["by_label"].get("datadog") for r in groups["off"]):
+        print("  note: Datadog traffic seen even with telemetry disabled")
 
 
 def export(args):
@@ -747,7 +867,9 @@ def export(args):
     cutoff = time.time() - opts["days"] * 86400
     turns = []
     sessions = {}
+    labels = load_labels()
     for r in load_rows():
+        r["by_label"] = relabel(r, labels)
         try:
             ts = datetime.fromisoformat(r["started"]).timestamp()
         except (KeyError, ValueError):
@@ -774,6 +896,7 @@ def export(args):
             "cache_write_tokens": u.get("cache_creation_input_tokens", 0),
             "output_tokens": u.get("output_tokens", 0),
             "models": u.get("models", []),
+            "telemetry_disabled": r.get("telemetry_disabled"),
         }
         turns.append(t)
         s = sessions.setdefault(r["sid"], {"sid": r["sid"], "session_name": r["session_name"],
@@ -790,6 +913,8 @@ def export(args):
         "notes": "Bytes are TCP payload (TLS included) counted from kernel tcp_info for the "
                  "Claude Code process tree; *_wire adds an IP+TCP header estimate per segment.",
         "totals": {
+            "datadog_query_bytes": sum(t["by_label"].get("datadog", {}).get("query", 0) for t in turns),
+            "datadog_response_bytes": sum(t["by_label"].get("datadog", {}).get("response", 0) for t in turns),
             "turns": len(turns),
             "query_bytes": sum(t["query_bytes"] for t in turns),
             "response_bytes": sum(t["response_bytes"] for t in turns),
