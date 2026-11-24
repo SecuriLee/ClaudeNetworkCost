@@ -4,6 +4,8 @@ I asked Claude Code a one-line question: "how to install". It sent 175 KB to ans
 
 I wanted to know what every query and every response costs on the wire, per session, without storing anything I wouldn't want to publish. So this is a small tool that sits in Claude Code's hooks and counts.
 
+The story, with a month of data from two machines and the charts to go with it: [1.24 Billion Tokens](https://about.ciso.li/AI/perspectives/1-24-billion-tokens.html).
+
 ## What I found on day one
 
 Monday 23 November 2026, the first day with the hooks in: two sessions on one box, 48 turns between 15:08 and 18:00, and **104 MB up, 4.1 MB down**. Session names are swapped for Session1 and Session2 here; the tool itself shows pseudonyms or names you give them.
