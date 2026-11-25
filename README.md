@@ -113,7 +113,8 @@ Nothing between turns. During a turn, a reading takes about 15 ms of CPU, roughl
 - Everything the Claude process tree does during the turn is counted: model calls, remote control, telemetry, MCP servers. The destination split tells them apart where the IP allows.
 - A turn cancelled with Esc gets no `Stop` hook. It's logged as `interrupted` when the next prompt arrives (Claude Code leaves a `[Request interrupted by user]` line in the transcript, which is how the tool tells it apart).
 - A message typed while Claude is still working fires the prompt hook too, but Claude Code folds it into the running turn. The tool does the same: one turn, shown as `ok (+1 mid-turn msg)`. Turns split by older versions can be put back together with `merge`, which backs up the log first and renumbers the later turns.
-- Subagent tokens live in their own transcripts and aren't in the token columns yet. Their bytes are counted.
+- Hitting the usage limit doesn't fire `Stop` either. The turn stays open through the wait, and whatever you type to carry on folds into it, so one turn can last five hours. Versions before 25 November 2026 stopped counting tokens at the first of those messages and logged such turns at 0 tokens and several MB; `recount` repairs them.
+- Subagents write their own transcripts. Their tokens are in a separate `agents` column (`usage_sub` in the log), and their bytes are already in the turn's totals, since they run inside the same process.
 
 ## Privacy
 
@@ -155,7 +156,11 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py name nimble-merlin "CNC build"  # give a session a name you'll recognise
 ./netcost.py name nimble-merlin --clear    # take it off again
 ./netcost.py merge "CNC build" 21          # fold turn 22 into turn 21 (a wrongly split turn)
+./netcost.py recount                       # re-derive every turn's tokens from the transcripts, by time (dry run)
+./netcost.py recount --apply               # ... and write them, backing up the log first
 ```
+
+`recount` gives every API reply to the turn that was running when it was written, main conversation and subagents alike. Run it once after updating from an older version, or whenever a turn looks wrong: it only changes rows that differ.
 
 ### Going back in time
 

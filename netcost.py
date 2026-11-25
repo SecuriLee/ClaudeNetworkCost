@@ -20,12 +20,15 @@ token counts and the session id.
 No root needed. Stdlib only.
 """
 
+import bisect
+import glob
 import hashlib
 import hmac
 import ipaddress
 import secrets
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -118,6 +121,9 @@ def pseudonym(session_id):
     sid = h[:6].hex()
     name = f"{ADJ[h[6] % len(ADJ)]}-{NOUN[h[7] % len(NOUN)]}-{sid[:4]}"
     return sid, name
+
+
+SETTLE_GRACE = 60  # s after Stop in which the final reply may still land
 
 
 def now_iso():
@@ -450,8 +456,20 @@ def wait_transcript_settled(path, quiet=1.5, limit=15.0):
             return
 
 
-def transcript_usage(path, offset):
-    """Sum usage from transcript lines written after byte offset."""
+def ts_epoch(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def transcript_usage(path, offset, until=None):
+    """Sum usage from transcript lines written after byte offset.
+
+    The turn ends at the next typed prompt. With `until` (epoch seconds of the
+    turn's end), prompts typed before that still belong to this turn: messages
+    sent mid-generation, and the "continue" after a usage-limit stop, where
+    Claude Code never fires Stop and the turn runs on for hours."""
     res = {"api_requests": 0, "input_tokens": 0, "output_tokens": 0,
            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
            "models": []}
@@ -472,14 +490,16 @@ def transcript_usage(path, offset):
                 if t == "user" and is_real_prompt(d):
                     prompts += 1
                     if prompts > 1:
-                        break  # the next turn's prompt: stop here
+                        pt = ts_epoch(d.get("timestamp"))
+                        if until is None or pt is None or pt >= until:
+                            break  # the next turn's prompt: stop here
                 if t == "api-request":
                     res["api_requests"] += 1
                 elif t == "assistant":
                     m = d.get("message") or {}
                     mid = m.get("id")
                     u = m.get("usage")
-                    if not u or mid in seen:
+                    if not u or mid in seen or m.get("model") == "<synthetic>":
                         continue
                     seen.add(mid)
                     if m.get("model"):
@@ -490,6 +510,45 @@ def transcript_usage(path, offset):
     except OSError:
         pass
     res["models"] = sorted(models)
+    return res
+
+
+def subagent_usage(path, t0, t1):
+    """Usage from this session's subagent transcripts (<transcript>/subagents/)
+    for replies timestamped between t0 and t1 (epoch seconds)."""
+    res = {"api_requests": 0, "agents": 0, "input_tokens": 0, "output_tokens": 0,
+           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    if not path or not path.endswith(".jsonl"):
+        return res
+    seen = set()
+    for f in sorted(glob.glob(os.path.join(path[:-6], "subagents", "*.jsonl"))):
+        used = False
+        try:
+            fh = open(f, "rb")
+        except OSError:
+            continue
+        with fh:
+            for raw in fh:
+                if b'"usage"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                m = d.get("message") or {}
+                u, mid = m.get("usage"), m.get("id")
+                if d.get("type") != "assistant" or not u or mid in seen or m.get("model") == "<synthetic>":
+                    continue
+                t = ts_epoch(d.get("timestamp"))
+                if t is None or not (t0 <= t <= t1):
+                    continue
+                seen.add(mid)
+                used = True
+                res["api_requests"] += 1
+                for k in ("input_tokens", "output_tokens",
+                          "cache_read_input_tokens", "cache_creation_input_tokens"):
+                    res[k] += int(u.get(k) or 0)
+        res["agents"] += used
     return res
 
 
@@ -721,7 +780,13 @@ def finalize(pending):
     wait_transcript_settled(job.get("transcript_path"))
     row = job["row"]
     row["by_label"] = relabel(row, load_labels(refresh=True))
-    row["usage"] = transcript_usage(job.get("transcript_path"), job.get("transcript_offset"))
+    path = job.get("transcript_path")
+    t0, t1 = ts_epoch(row.get("started")), ts_epoch(row.get("ended"))
+    # an interrupted turn ends when the next prompt arrives: that prompt is not ours
+    until = t1 - 2 if t1 and row.get("status") == "interrupted" else t1
+    row["usage"] = transcript_usage(path, job.get("transcript_offset"), until)
+    if t0 and t1:
+        row["usage_sub"] = subagent_usage(path, t0, t1 + SETTLE_GRACE)
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -826,7 +891,7 @@ def report(args):
         return report_by(rows, opts["by"], opts["last"])
     if opts["tokens"]:
         print(f"{'started (local)':16} {'session':22} {'#':>3} {'calls':>5} {'input':>6} {'cache rd':>9} "
-              f"{'cache wr':>8} {'output':>7} {'ctx/call':>8} {'query':>9} {'response':>9} {'B/out':>6}")
+              f"{'cache wr':>8} {'output':>7} {'ctx/call':>8} {'agents':>7} {'query':>9} {'response':>9} {'B/out':>6}")
         tt = defaultdict(int)
         for r in rows[-opts["last"]:]:
             t = datetime.fromisoformat(r["started"]).astimezone().strftime("%m-%d %H:%M:%S")
@@ -837,14 +902,17 @@ def report(args):
             for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
                 tt[k] += u.get(k, 0)
             ot = u.get("output_tokens", 0)
+            sub = usage_total(r.get("usage_sub"))
+            tt["sub"] += sub
             print(f"{t:16} {display_name(r, aliases):22} {r['turn']:>3} {calls:>5} {u.get('input_tokens', 0):>6} "
                   f"{u.get('cache_read_input_tokens', 0):>9} {u.get('cache_creation_input_tokens', 0):>8} "
-                  f"{ot:>7} {tin // max(calls, 1):>8} {human(r['query_bytes']):>9} "
+                  f"{ot:>7} {tin // max(calls, 1):>8} {fmt_tokens(sub) if sub else '-':>7} {human(r['query_bytes']):>9} "
                   f"{human(r['response_bytes']):>9} {r['response_bytes'] / ot if ot else 0:>6.0f}")
         print()
         print(f"tokens: input {tt['input_tokens']}, cache read {tt['cache_read_input_tokens']}, "
-              f"cache write {tt['cache_creation_input_tokens']}, output {tt['output_tokens']}")
-        print("(main conversation only; ctx/call = tokens processed per API call; B/out = response bytes per output token)")
+              f"cache write {tt['cache_creation_input_tokens']}, output {tt['output_tokens']}"
+              + (f"; subagents {tt['sub']}" if tt["sub"] else ""))
+        print("(columns: main conversation; agents = subagent tokens in that turn; ctx/call = tokens processed per API call; B/out = response bytes per output token)")
         return
 
     print(f"{'started (local)':16} {'session':22} {'#':>3} {'dur':>5} {'query':>9} {'response':>9} "
@@ -905,13 +973,14 @@ def report_by(rows, by, last):
         x["calls"] += u.get("api_requests", 0)
         for f in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
             x[f] += u.get(f, 0)
+        x["agents"] += usage_total(r.get("usage_sub"))
         x["up"] += r["query_bytes"]
         x["down"] += r["response_bytes"]
         sess[k].add(r["sid"])
     keys = sorted(b)[-last:]
     w = 16 if by == "hour" else 10
     print(f"{by:{w}} {'sess':>4} {'turns':>5} {'calls':>5} {'input':>6} {'cache rd':>9} {'cache wr':>8} "
-          f"{'output':>7} {'total':>8}  {'up':>9} {'down':>9}  output")
+          f"{'output':>7} {'total':>8} {'agents':>7}  {'up':>9} {'down':>9}  output")
     peak = max((b[k]["output_tokens"] for k in keys), default=0) or 1
     tot = defaultdict(int)
     for k in keys:
@@ -923,11 +992,12 @@ def report_by(rows, by, last):
         bar = "#" * max(1 if x["output_tokens"] else 0, round(20 * x["output_tokens"] / peak))
         print(f"{k:{w}} {len(sess[k]):>4} {x['turns']:>5} {x['calls']:>5} {fmt_tokens(x['input_tokens']):>6} "
               f"{fmt_tokens(x['cache_read_input_tokens']):>9} {fmt_tokens(x['cache_creation_input_tokens']):>8} "
-              f"{fmt_tokens(x['output_tokens']):>7} {fmt_tokens(total):>8}  {human(x['up']):>9} {human(x['down']):>9}  {bar}")
+              f"{fmt_tokens(x['output_tokens']):>7} {fmt_tokens(total):>8} {fmt_tokens(x['agents']) if x['agents'] else '-':>7}  {human(x['up']):>9} {human(x['down']):>9}  {bar}")
     print(f"{'total':{w}} {'':>4} {tot['turns']:>5} {tot['calls']:>5} {fmt_tokens(tot['input_tokens']):>6} "
           f"{fmt_tokens(tot['cache_read_input_tokens']):>9} {fmt_tokens(tot['cache_creation_input_tokens']):>8} "
-          f"{fmt_tokens(tot['output_tokens']):>7} {fmt_tokens(tot['total']):>8}  {human(tot['up']):>9} {human(tot['down']):>9}")
-    print("(local time; total = input + cache read + cache write + output; bar = output tokens)")
+          f"{fmt_tokens(tot['output_tokens']):>7} {fmt_tokens(tot['total']):>8} {fmt_tokens(tot['agents']) if tot['agents'] else '-':>7}  {human(tot['up']):>9} {human(tot['down']):>9}")
+    print("(local time; total = main conversation: input + cache read + cache write + output;\n"
+          " agents = subagent tokens on top; bar = output tokens)")
 
 
 def datadog_report(rows):
@@ -1205,6 +1275,87 @@ def scan_transcripts(root=None):
                     "output_tokens": int(u.get("output_tokens") or 0),
                 })
     return recs, len(files)
+
+
+USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def usage_total(u):
+    return sum(int((u or {}).get(k) or 0) for k in USAGE_KEYS)
+
+
+def recount(args):
+    """Re-derive each logged turn's tokens from the transcripts by time: every
+    API reply belongs to the turn that was running when it was written. Fixes
+    rows logged before the usage-limit fix and adds subagent tokens
+    (usage_sub). Dry run unless --apply."""
+    only, apply_, root = None, "--apply" in args, None
+    if "--session" in args:
+        only = resolve_session(args[args.index("--session") + 1])
+    if "--root" in args:
+        root = args[args.index("--root") + 1]
+    rows = load_rows()
+    recs, _ = scan_transcripts(root)
+    pseu = {}
+    turns = defaultdict(list)
+    for i, r in enumerate(rows):
+        if only and r.get("sid") != only:
+            continue
+        t0, t1 = ts_epoch(r.get("started")), ts_epoch(r.get("ended"))
+        if t0 and t1:
+            turns[r["sid"]].append((t0, t1, i))
+    for v in turns.values():
+        v.sort()
+    new = {}
+    for rec in recs:
+        sess = rec["session"]
+        if sess not in pseu:
+            pseu[sess] = pseudonym(sess)[0]
+        lst = turns.get(pseu[sess])
+        if not lst:
+            continue
+        t = rec["t"].timestamp()
+        j = bisect.bisect_right([x[0] for x in lst], t) - 1
+        if j < 0:
+            continue
+        limit = lst[j][1] + SETTLE_GRACE
+        if j + 1 < len(lst):
+            limit = min(limit, lst[j + 1][0])
+        if t > limit:
+            continue
+        idx = lst[j][2]
+        u = new.setdefault(idx, {"usage": {"api_requests": 0, **{k: 0 for k in USAGE_KEYS}, "models": set()},
+                                 "usage_sub": {"api_requests": 0, "agents": 0, **{k: 0 for k in USAGE_KEYS}}})
+        d = u["usage_sub"] if rec["sub"] else u["usage"]
+        d["api_requests"] += 1
+        for k in USAGE_KEYS:
+            d[k] += rec[k]
+        if not rec["sub"]:
+            d["models"].add(rec["model"])
+    changed = 0
+    print(f"{'session':<20} {'turn':>4} {'started':<15} {'old':>10} {'new':>10} {'agents':>10}")
+    for idx in sorted(new):
+        r, u = rows[idx], new[idx]
+        u["usage"]["models"] = sorted(u["usage"]["models"])
+        old = usage_total(r.get("usage"))
+        nw, sub = usage_total(u["usage"]), usage_total(u["usage_sub"])
+        if nw != old or sub != usage_total(r.get("usage_sub")):
+            changed += 1
+            t = datetime.fromisoformat(r["started"]).astimezone().strftime("%m-%d %H:%M:%S")
+            print(f"{(r.get('session_name') or r['sid'])[:20]:<20} {r.get('turn') or 0:>4} {t:<15} "
+                  f"{fmt_tokens(old):>10} {fmt_tokens(nw):>10} {fmt_tokens(sub):>10}")
+            r["usage"] = u["usage"]
+            r["usage_sub"] = u["usage_sub"]
+    print(f"{changed} turn(s) differ" + ("" if apply_ else " (dry run: --apply to write)"))
+    if apply_ and changed:
+        backup = f"{LOG_FILE}.bak-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        shutil.copy2(LOG_FILE, backup)
+        tmp = f"{LOG_FILE}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        os.replace(tmp, LOG_FILE)
+        print(f"written; backup at {backup}")
 
 
 def dump_history(path, root=None, host=None):
@@ -1634,6 +1785,8 @@ def main():
         history(sys.argv[2:])
     elif cmd == "digest":
         digest(sys.argv[2:])
+    elif cmd == "recount":
+        recount(sys.argv[2:])
     else:
         print("usage: netcost.py report [--last N] [--session NAME] [--json]\n"
               "       netcost.py export [PATH] [--days N]\n"
@@ -1641,6 +1794,7 @@ def main():
               "       netcost.py name [<session> <alias...> | <session> --clear]\n"
               "       netcost.py merge <session> <turn>   (fold turn+1 into turn)\n"
               "       netcost.py history [--by day|hour|project|session|model] [--last N]\n"
+              "       netcost.py recount [--session NAME] [--apply]   (re-derive tokens by time, + subagents)\n"
               "       netcost.py digest [--period rolling|day|week|month|auto] [--telegram]\n"
               "  (hooks: start | stop | end)", file=sys.stderr)
         sys.exit(2)
