@@ -445,6 +445,16 @@ def is_real_prompt(entry):
     return False
 
 
+def is_turn_start(entry):
+    """A prompt that starts an exchange: typed, or delivered by another Claude
+    session (those are isMeta and fire no prompt hook)."""
+    if entry.get("type") != "user" or entry.get("isSidechain"):
+        return False
+    if (entry.get("origin") or {}).get("kind") == "peer" or entry.get("turnOrigin") == "peer":
+        return True
+    return is_real_prompt(entry)
+
+
 def wait_transcript_settled(path, quiet=1.5, limit=15.0):
     """Wait until the transcript hasn't grown for `quiet` seconds (max `limit`)."""
     last, since, t0 = file_size(path), time.time(), time.time()
@@ -488,7 +498,7 @@ def transcript_usage(path, offset, until=None):
                 except ValueError:
                     continue
                 t = d.get("type")
-                if t == "user" and is_real_prompt(d):
+                if t == "user" and is_turn_start(d):
                     prompts += 1
                     if prompts > 1:
                         pt = ts_epoch(d.get("timestamp"))
@@ -1230,9 +1240,11 @@ def merge_cmd(args):
     print(f"{pname}: merged turns {n} and {n + 1} (backup: {backup})")
 
 
-def scan_transcripts(root=None):
+def scan_transcripts(root=None, prompts=None):
     """One record per API reply in every transcript under root (subagents
-    included), deduplicated by message id. Returns (records, n_files)."""
+    included), deduplicated by message id. Returns (records, n_files).
+    With a `prompts` dict, also collects {session id: [epoch of each typed
+    or delivered prompt in the main conversation]}."""
     root = root or os.path.expanduser("~/.claude/projects")
     seen = set()
     recs = []
@@ -1247,6 +1259,16 @@ def scan_transcripts(root=None):
             continue
         with f:
             for raw in f:
+                if prompts is not None and not sub and b'"type":"user"' in raw:
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if is_turn_start(d):
+                        pt = ts_epoch(d.get("timestamp"))
+                        if pt:
+                            prompts.setdefault(d.get("sessionId") or "?", []).append(pt)
+                    continue
                 if b'"usage"' not in raw or b'"assistant"' not in raw:
                     continue
                 try:
@@ -1270,6 +1292,7 @@ def scan_transcripts(root=None):
                     "project": os.path.basename((d.get("cwd") or "?").rstrip("/")) or "/",
                     "model": m.get("model") or "?",
                     "sub": sub or bool(d.get("isSidechain")),
+                    "file": path if sub else None,
                     "input_tokens": int(u.get("input_tokens") or 0),
                     "cache_read_input_tokens": int(u.get("cache_read_input_tokens") or 0),
                     "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens") or 0),
@@ -1298,7 +1321,10 @@ def recount(args):
     if "--root" in args:
         root = args[args.index("--root") + 1]
     rows = load_rows()
-    recs, _ = scan_transcripts(root)
+    prompts = {}
+    recs, _ = scan_transcripts(root, prompts)
+    for v in prompts.values():
+        v.sort()
     pseu = {}
     turns = defaultdict(list)
     for i, r in enumerate(rows):
@@ -1328,11 +1354,20 @@ def recount(args):
             limit = min(limit, lst[j + 1][0])
         if t > limit:
             continue
+        if not rec["sub"] and t > lst[j][1]:
+            # after Stop: only the turn's own final reply, not one answering a
+            # prompt that fired no hook (e.g. a message from another session)
+            pl = prompts.get(sess, [])
+            k = bisect.bisect_right(pl, lst[j][1])
+            if k < len(pl) and pl[k] <= t:
+                continue
         idx = lst[j][2]
         u = new.setdefault(idx, {"usage": {"api_requests": 0, **{k: 0 for k in USAGE_KEYS}, "models": set()},
                                  "usage_sub": {"api_requests": 0, "agents": 0, **{k: 0 for k in USAGE_KEYS}}})
         d = u["usage_sub"] if rec["sub"] else u["usage"]
         d["api_requests"] += 1
+        if rec["sub"]:
+            u.setdefault("files", set()).add(rec.get("file") or "?")
         for k in USAGE_KEYS:
             d[k] += rec[k]
         if not rec["sub"]:
@@ -1342,9 +1377,11 @@ def recount(args):
     for idx in sorted(new):
         r, u = rows[idx], new[idx]
         u["usage"]["models"] = sorted(u["usage"]["models"])
+        u["usage_sub"]["agents"] = len(u.pop("files", ()))
         old = usage_total(r.get("usage"))
         nw, sub = usage_total(u["usage"]), usage_total(u["usage_sub"])
-        if nw != old or sub != usage_total(r.get("usage_sub")):
+        if (nw != old or sub != usage_total(r.get("usage_sub"))
+                or u["usage_sub"]["agents"] != (r.get("usage_sub") or {}).get("agents", 0)):
             changed += 1
             t = datetime.fromisoformat(r["started"]).astimezone().strftime("%m-%d %H:%M:%S")
             print(f"{(r.get('session_name') or r['sid'])[:20]:<20} {r.get('turn') or 0:>4} {t:<15} "

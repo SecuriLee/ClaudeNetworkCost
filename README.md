@@ -114,6 +114,7 @@ Nothing between turns. During a turn, a reading takes about 15 ms of CPU, roughl
 - A turn cancelled with Esc gets no `Stop` hook. It's logged as `interrupted` when the next prompt arrives (Claude Code leaves a `[Request interrupted by user]` line in the transcript, which is how the tool tells it apart).
 - A message typed while Claude is still working fires the prompt hook too, but Claude Code folds it into the running turn. The tool does the same: one turn, shown as `ok (+1 mid-turn msg)`. Turns split by older versions can be put back together with `merge`, which backs up the log first and renumbers the later turns.
 - Hitting the usage limit doesn't fire `Stop` either. The turn stays open through the wait, and whatever you type to carry on folds into it, so one turn can last five hours. Versions before 25 November 2026 stopped counting tokens at the first of those messages and logged such turns at 0 tokens and several MB; `recount` repairs them.
+- A message from another Claude session (cross-session messaging) starts an exchange without firing the prompt hook, so those exchanges aren't measured at all: no bytes, no tokens. The token reader and `recount` treat them as a boundary, so their calls don't land in the turn before.
 - Subagents write their own transcripts. Their tokens are in a separate `agents` column (`usage_sub` in the log), and their bytes are already in the turn's totals, since they run inside the same process.
 
 ## Privacy
