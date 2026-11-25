@@ -124,6 +124,7 @@ def pseudonym(session_id):
 
 
 SETTLE_GRACE = 60  # s after Stop in which the final reply may still land
+BACKGROUND_GRACE = 6 * 3600  # recount: background subagents after the last turn
 
 
 def now_iso():
@@ -1286,12 +1287,14 @@ def usage_total(u):
 
 def recount(args):
     """Re-derive each logged turn's tokens from the transcripts by time: every
-    API reply belongs to the turn that was running when it was written. Fixes
+    API reply belongs to the turn that was running when it was written
+    (subagent replies: the last turn started before them, as background
+    agents run on after the turn ends). Fixes
     rows logged before the usage-limit fix and adds subagent tokens
     (usage_sub). Dry run unless --apply."""
     only, apply_, root = None, "--apply" in args, None
     if "--session" in args:
-        only = resolve_session(args[args.index("--session") + 1])
+        only = resolve_session(args[args.index("--session") + 1])[0]
     if "--root" in args:
         root = args[args.index("--root") + 1]
     rows = load_rows()
@@ -1318,7 +1321,9 @@ def recount(args):
         j = bisect.bisect_right([x[0] for x in lst], t) - 1
         if j < 0:
             continue
-        limit = lst[j][1] + SETTLE_GRACE
+        # main replies end with the turn; subagents may run on in the
+        # background after it, so theirs count until the next turn starts
+        limit = lst[j][1] + (BACKGROUND_GRACE if rec["sub"] else SETTLE_GRACE)
         if j + 1 < len(lst):
             limit = min(limit, lst[j + 1][0])
         if t > limit:

@@ -160,7 +160,7 @@ New sessions pick the hooks up. Running ones may need a restart.
 ./netcost.py recount --apply               # ... and write them, backing up the log first
 ```
 
-`recount` gives every API reply to the turn that was running when it was written, main conversation and subagents alike. Run it once after updating from an older version, or whenever a turn looks wrong: it only changes rows that differ.
+`recount` gives every API reply to the turn that was running when it was written. Subagents can carry on in the background after a turn ends; their replies go to the last turn that started before them. The live hooks only see subagent calls made during the turn itself, so `recount` also catches those stragglers. Run it once after updating from an older version, or whenever a turn looks wrong: it only changes rows that differ.
 
 ### Going back in time
 
